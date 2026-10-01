@@ -1,0 +1,9 @@
+{
+  "name": "nexi-one",
+  "version": "2.0.0",
+  "description": "NEXI ONE — PWA gamifiée de Nexi Academy (build optimisé grande échelle)",
+  "private": true,
+  "scripts": {
+    "dev": "npx serve . -l 3000"
+  }
+}

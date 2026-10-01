@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NEXI ONE — Apprends, joue, progresse</title>
+<meta name="description" content="NEXI ONE, l'application gamifiée de Nexi Academy : défis, affinités RIASEC, cartes de révision et classement.">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#070B14">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body class="no-scroll">
+<div class="circuit-bg"></div>
+
+<div class="stack-container" id="stack">
+
+  <!-- Page 1 — Hero -->
+  <section class="stack-page" data-index="0">
+    <div class="stack-page-inner hero">
+      <div class="logo-wrap" id="logo-trigger"><img src="icons/icon-192.png" alt="Logo Nexi Academy"></div>
+      <h1>Apprends en jouant.<br><span class="accent">Deviens toi-même.</span></h1>
+      <p class="tagline">NEXI ONE transforme les leçons en défis, révèle tes affinités et t'aide à choisir ta voie.</p>
+    </div>
+  </section>
+
+  <!-- Page 2 — Fonctionnalités -->
+  <section class="stack-page" data-index="1">
+    <div class="stack-page-inner">
+      <h2 style="text-align:center; margin-bottom:22px;">Ce que tu vas découvrir</h2>
+      <div class="features">
+        <div class="feature card"><h4>🎯 Défis hebdomadaires</h4><p>QCM chronométrés par catégorie, avec corrigé détaillé après chaque tentative.</p></div>
+        <div class="feature card"><h4>🧭 Mes affinités (RIASEC)</h4><p>Des questions sans stress qui révèlent ton profil et orientent tes choix.</p></div>
+        <div class="feature card"><h4>🗂️ Cartes de révision</h4><p>Recto-verso avec explications détaillées, mises à jour classe par classe.</p></div>
+        <div class="feature card"><h4>🏆 Classement anonyme</h4><p>Seul ton identifiant apparaît — jamais ton nom.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Page 3 — À propos -->
+  <section class="stack-page" data-index="2">
+    <div class="stack-page-inner" style="max-width:560px; margin:auto; text-align:center;">
+      <h2>Nexi Academy</h2>
+      <p style="font-size:1.02rem;">Nexi Academy est un écosystème éducatif basé sur l'apprentissage gamifié. Nexi Studio, son unité d'outils numériques, développe NEXI ONE pour accompagner les élèves du secondaire (RDC) dans leurs apprentissages et leur orientation.</p>
+      <a id="about-link" class="btn secondary" href="#" target="_blank" rel="noopener" style="margin-top:10px; display:none;">Visiter le site de Nexi Academy</a>
+    </div>
+  </section>
+
+  <!-- Page 4 — Connexion (unique, aucun rôle affiché) -->
+  <section class="stack-page" data-index="3">
+    <div class="stack-page-inner" style="max-width:400px; margin:auto;">
+      <div class="card auth-box glow">
+        <h3 style="text-align:center;">Connexion</h3>
+        <form id="login-form">
+          <div class="field"><label>Identifiant</label><input type="text" id="f-identifiant" autocomplete="username" required></div>
+          <div class="field"><label>Mot de passe</label><input type="password" id="f-password" autocomplete="current-password" required></div>
+          <button type="submit" class="btn block" id="btn-login">Se connecter</button>
+        </form>
+        <p id="login-error" style="color:var(--coral); font-size:.85rem; margin-top:10px; display:none;"></p>
+      </div>
+    </div>
+  </section>
+
+  <button class="stack-back-btn" id="stack-back" aria-label="Précédent" style="display:none;">‹</button>
+  <button class="stack-next-btn" id="stack-next" aria-label="Suivant">›</button>
+  <div class="stack-dots" id="stack-dots"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/gamify.js"></script>
+<script src="js/sync.js"></script>
+<script>
+  armSecretAdminTrigger(document.getElementById("logo-trigger"));
+
+  // Lien "site Nexi Academy" : affiché seulement si SITE_URL est renseigné dans js/config.js
+  (function () {
+    const l = document.getElementById("about-link");
+    const u = (window.NEXI_CONFIG && window.NEXI_CONFIG.SITE_URL) || "";
+    if (l && u) { l.href = u; l.style.display = ""; }
+  })();
+
+  // redirige si déjà connecté
+  NexiAuth.redirectToOwnPanel();
+
+  // ---------- Navigation "pages empilées" : le clic révèle, aucun glissement ----------
+  const pages = Array.from(document.querySelectorAll(".stack-page"));
+  const dotsWrap = document.getElementById("stack-dots");
+  let current = 0;
+  pages.forEach((_, i) => {
+    const d = document.createElement("span");
+    d.className = "dot";
+    d.addEventListener("click", () => goTo(i));
+    dotsWrap.appendChild(d);
+  });
+
+  function layout() {
+    pages.forEach((p, i) => {
+      const depth = i - current;
+      p.classList.remove("is-active");
+      if (depth === 0) {
+        p.style.transform = "translateY(0) scale(1)";
+        p.style.opacity = "1"; p.style.zIndex = 10; p.style.pointerEvents = "auto";
+        p.classList.add("is-active");
+      } else if (depth > 0) {
+        const d = Math.min(depth, 3);
+        p.style.transform = `translateY(${d * 16}px) scale(${1 - d * 0.055})`;
+        p.style.opacity = d > 2 ? "0" : String(0.65 - d * 0.15);
+        p.style.zIndex = 9 - d; p.style.pointerEvents = "none";
+      } else {
+        p.style.transform = "translateY(-22px) scale(1.03)";
+        p.style.opacity = "0"; p.style.zIndex = 1; p.style.pointerEvents = "none";
+      }
+    });
+    document.querySelectorAll(".stack-dots .dot").forEach((d, i) => d.classList.toggle("active", i === current));
+    document.getElementById("stack-back").style.display = current === 0 ? "none" : "flex";
+    document.getElementById("stack-next").style.display = current === pages.length - 1 ? "none" : "flex";
+  }
+  function goTo(i) { current = Math.max(0, Math.min(pages.length - 1, i)); layout(); }
+
+  document.getElementById("stack-next").addEventListener("click", () => goTo(current + 1));
+  document.getElementById("stack-back").addEventListener("click", () => goTo(current - 1));
+  // cliquer sur une carte partiellement visible derrière fait aussi avancer
+  pages.forEach((p, i) => p.addEventListener("click", (e) => {
+    if (i === current + 1 && !e.target.closest("a,button,input")) goTo(i);
+  }));
+  layout();
+
+  // ---------- Connexion unifiée ----------
+  document.getElementById("login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById("btn-login");
+    const errEl = document.getElementById("login-error");
+    errEl.style.display = "none";
+    btn.disabled = true; btn.textContent = "Connexion…";
+    const id = document.getElementById("f-identifiant").value.trim();
+    const pw = document.getElementById("f-password").value;
+    const res = await NexiAuth.login(id, pw);
+    btn.disabled = false; btn.textContent = "Se connecter";
+    if (!res.ok) { errEl.textContent = res.message; errEl.style.display = "block"; return; }
+    window.location.href = res.role === "eleve" ? "eleve.html" : "superviseur.html";
+  });
+</script>
+</body>
+</html>

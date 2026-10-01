@@ -1,0 +1,10 @@
+# NEXI ONE n'a pas besoin de variables d'environnement serveur : c'est un
+# site 100% statique qui parle directement à Supabase avec la clé "anon"
+# publique (voir js/config.js). La sécurité vient des policies RLS + des
+# fonctions RPC du schéma, pas du secret de cette clé.
+#
+# Ce fichier est prévu si vous ajoutez plus tard une fonction serverless
+# (ex : envoi d'email, export PDF, webhook...).
+
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=

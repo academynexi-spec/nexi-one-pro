@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Administration — NEXI ONE</title>
+<meta name="robots" content="noindex, nofollow">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="circuit-bg"></div>
+<div class="screen">
+  <div id="admin-login-screen" class="view" style="display:none; max-width:420px; margin:auto;">
+    <div class="card auth-box glow">
+      <h3 style="text-align:center;">Accès administrateur</h3>
+      <form id="admin-login-form">
+        <div class="field"><label>Identifiant</label><input id="a-id" required></div>
+        <div class="field"><label>Mot de passe</label><input id="a-pw" type="password" required></div>
+        <button class="btn block" type="submit">Entrer</button>
+      </form>
+      <p id="admin-login-error" style="color:var(--coral); font-size:.85rem; display:none; margin-top:10px;"></p>
+    </div>
+  </div>
+
+  <div id="admin-app" style="display:none;">
+    <header class="topbar">
+      <div class="brand"><img src="icons/icon-192.png" alt=""> NEXI ONE · Admin</div>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btn-logout">Quitter</button>
+    </header>
+    <main class="view" style="max-width:1000px;">
+      <div class="admin-tabs">
+        <button data-view="eleves" class="active">Enfants</button>
+        <button data-view="defis">Défis</button>
+        <button data-view="affinites">Affinités</button>
+        <button data-view="cartes">Cartes</button>
+        <button data-view="etablissements">Établissements</button>
+        <button data-view="classements">Classements</button>
+        <button data-view="diagnostic">Diagnostic</button>
+        <button data-view="reglages">Réglages</button>
+      </div>
+      <div id="view-root"></div>
+    </main>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/gamify.js"></script>
+<script src="js/admin.js"></script>
+</body>
+</html>

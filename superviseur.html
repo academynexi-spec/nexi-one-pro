@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Espace Superviseur — NEXI ONE</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#070B14">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="screen">
+  <header class="topbar">
+    <div class="brand"><img src="icons/icon-192.png" alt=""> NEXI ONE · Superviseur</div>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="btn-logout">Quitter</button>
+  </header>
+  <main class="view" style="max-width:900px;">
+    <div class="admin-tabs">
+      <button data-view="eleves" class="active">Mes élèves</button>
+      <button data-view="stats">Statistiques</button>
+      <button data-view="suggerer">Suggérer un élève</button>
+    </div>
+    <div id="view-root"></div>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/gamify.js"></script>
+<script src="js/superviseur.js"></script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mon espace — NEXI ONE</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#070B14">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="screen">
+  <header class="topbar">
+    <div class="brand"><img src="icons/icon-192.png" alt=""> NEXI ONE</div>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="btn-logout">Quitter</button>
+  </header>
+
+  <main id="view-root" class="view"></main>
+
+  <nav class="bottomnav">
+    <button data-view="profil" class="active">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.5-6 8-6s8 2 8 6"/></svg>
+      Profil
+    </button>
+    <button data-view="defis">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5"/></svg>
+      Défis
+    </button>
+    <button data-view="affinites">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18"/></svg>
+      Affinités
+    </button>
+    <button data-view="cartes">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="12" height="16" rx="2"/><rect x="8" y="2" width="12" height="16" rx="2"/></svg>
+      Cartes
+    </button>
+    <button data-view="classement">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21V10M12 21V3M20 21v-7"/></svg>
+      Classement
+    </button>
+  </nav>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="js/config.js"></script>
+<script src="js/supabaseClient.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/gamify.js"></script>
+<script src="js/sync.js"></script>
+<script src="js/nexibot.js"></script>
+<script src="js/eleve.js"></script>
+</body>
+</html>
