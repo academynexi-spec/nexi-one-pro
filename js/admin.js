@@ -26,7 +26,6 @@ if (!session || session.role !== "admin") {
       render(btn.dataset.view);
     });
   });
-  render("eleves");
 }
 
 function tok() { return session.token; }
@@ -185,7 +184,7 @@ async function renderDefis() {
   root.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => openDefiModal(defis.find(x => x.id === b.dataset.edit))));
   root.querySelectorAll("[data-manage]").forEach(b => b.addEventListener("click", () => renderQuestions(defis.find(x => x.id === b.dataset.manage))));
   root.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
-    if (!confirm("Supprimer ce défi supprime AUSSI tous les résultats des élèves qui l'ont joué (scores, classement). Pour le retirer sans rien perdre : Éditer, puis décocher « Publié ». Supprimer quand même ?")) return;
+    if (!confirm("Supprimer ce défi et ses questions ?")) return;
     await sb.rpc("admin_delete_defi", { p_token: tok(), p_id: b.dataset.del }); renderDefis();
   }));
 }
@@ -250,7 +249,7 @@ async function renderQuestions(defi) {
     const { error } = await sb.rpc("admin_upsert_question", {
       p_token: tok(), p_id: null, p_defi_id: defi.id, p_categorie_nom: document.getElementById("q-cat").value.trim(),
       p_ordre: (questions?.length || 0) + 1, p_enonce: document.getElementById("q-enonce").value,
-      p_options: opts, p_bonnes: bonnes, p_explication: document.getElementById("q-expl").value,
+      p_options: JSON.stringify(opts), p_bonnes: bonnes, p_explication: document.getElementById("q-expl").value,
       p_temps: parseInt(document.getElementById("q-temps").value, 10)
     });
     if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
@@ -272,7 +271,7 @@ async function renderQuestions(defi) {
       const ordre = ordreBase++;
       const { error } = await sb.rpc("admin_upsert_question", {
         p_token: tok(), p_id: null, p_defi_id: defi.id, p_categorie_nom: cat.trim(), p_ordre: ordre,
-        p_enonce: enonce.trim(), p_options: opts, p_bonnes: bonnes,
+        p_enonce: enonce.trim(), p_options: JSON.stringify(opts), p_bonnes: bonnes,
         p_explication: expl ? expl.trim() : null, p_temps: tempsStr ? parseInt(tempsStr, 10) : 30
       });
       if (error) throw error;
@@ -336,9 +335,9 @@ async function renderAffinites() {
 }
 
 // =========================================================
-// CARTES DE RÉVISION
+// CARTES DE RÉVISION — ancien écran (conservé comme filet de sécurité)
 // =========================================================
-async function renderCartes() {
+async function renderCartesLegacy() {
   const { data: cartes } = await sb.rpc("admin_list_cartes", { p_token: tok() });
   root.innerHTML = `
     <h2>Cartes de révision</h2>
@@ -403,6 +402,370 @@ async function renderCartes() {
     }
     renderCartes();
   });
+}
+
+// =========================================================
+// CARTES DE RÉVISION PAR COURS (v2) + IMPORT EN MASSE
+// Bascule automatiquement sur l'ancien écran (renderCartesLegacy) tant que
+// le patch SQL « cours et import » n'est pas appliqué : déploiement sans risque.
+// =========================================================
+function isMissingFn(error) {
+  const m = (error?.message || "").toLowerCase();
+  return error?.code === "PGRST202" || m.includes("could not find the function") || m.includes("schema cache");
+}
+
+function adminAuthFail(error) {
+  if (!/non autorisé/i.test(error?.message || "")) return false;
+  NexiGamify.toast("Session admin expirée — reconnexion nécessaire.", "error");
+  setTimeout(() => NexiAuth.logout(), 1500);
+  return true;
+}
+
+const NexiImport = (function () {
+  function detectDelim(t) {
+    const l = t.split(/\r?\n/).find(x => x.trim()) || ""; const c = { "\t": 0, ";": 0, ",": 0 }; let q = false;
+    for (const ch of l) { if (ch === '"') q = !q; else if (!q && ch in c) c[ch]++; }
+    return Object.keys(c).sort((a, b) => c[b] - c[a])[0];
+  }
+  function parseTable(t, d) {
+    const rows = []; let r = [], f = "", q = false, ln = 1, start = 1; t = t.replace(/^\uFEFF/, "");
+    const push = () => { r.push(f); f = ""; };
+    const end = () => { push(); if (r.some(x => x.trim() !== "")) rows.push({ ligne: start, c: r }); r = []; };
+    for (let i = 0; i < t.length; i++) {
+      const ch = t[i];
+      if (q) { if (ch === '"') { if (t[i + 1] === '"') { f += '"'; i++; } else q = false; } else { if (ch === "\n") ln++; f += ch; } }
+      else if (ch === '"' && f === "") q = true;
+      else if (ch === d) push();
+      else if (ch === "\r") { }
+      else if (ch === "\n") { end(); ln++; start = ln; }
+      else f += ch;
+    }
+    if (f !== "" || r.length) end();
+    return rows;
+  }
+  const COLS = { classe: ["classe", "class"], cours: ["cours", "intitule", "matiere", "course"], recto: ["recto", "question"], verso: ["verso", "reponse", "answer"], explication: ["explication", "contenu", "explanation"] };
+  const norm = s => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z]/g, "");
+  function toRecords(rows) {
+    if (!rows.length) return [];
+    const h = rows[0].c.map(norm);
+    const find = k => h.findIndex(x => COLS[k].some(a => x === a || x.includes(a)));
+    const isHead = ["classe", "cours", "recto"].some(k => find(k) >= 0);
+    let idx = { classe: 0, cours: 1, recto: 2, verso: 3, explication: 4 };
+    if (isHead) { idx = {}; for (const k in COLS) { const i = find(k); if (i >= 0) idx[k] = i; } }
+    return rows.slice(isHead ? 1 : 0).map(r => { const o = { ligne: r.ligne }; for (const k in idx) o[k] = (r.c[idx[k]] || "").trim(); return o; });
+  }
+  function chunk(a, n) { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; }
+  return { detectDelim, parseTable, toRecords, chunk };
+})();
+
+const cartesState = { classe: "", cours: "", search: "", page: 0, pageSize: 50 };
+let coursCache = [];
+let impRecords = [], impLot = null;
+
+async function renderCartes() {
+  const { data: cours, error } = await sb.rpc("admin_list_cours", { p_token: tok() });
+  if (error) {
+    if (isMissingFn(error)) return renderCartesLegacy();
+    if (adminAuthFail(error)) return;
+    root.innerHTML = `<div class="empty-state"><h4>Erreur</h4><p>${esc(error.message || "")}</p></div>`; return;
+  }
+  coursCache = cours || [];
+  const reels = coursCache.filter(c => c.id);
+  const f = cartesState;
+  const { data: cartes, error: e2 } = await sb.rpc("admin_list_cartes_v2", {
+    p_token: tok(), p_classe: f.classe || null,
+    p_cours_id: (f.cours && f.cours !== "__none") ? f.cours : null, p_sans_cours: f.cours === "__none",
+    p_search: f.search || null, p_limit: f.pageSize, p_offset: f.page * f.pageSize
+  });
+  if (e2) { if (adminAuthFail(e2)) return; root.innerHTML = `<div class="empty-state"><h4>Erreur</h4><p>${esc(e2.message || "")}</p></div>`; return; }
+  if (!(cartes && cartes.length) && f.page > 0) { f.page = 0; return renderCartes(); }
+  const total = cartes && cartes.length ? Number(cartes[0].total) : 0;
+  const pages = Math.max(1, Math.ceil(total / f.pageSize));
+  const optCours = (selected, withNone) => `${withNone ? `<option value="">${withNone}</option>` : ""}${reels.map(c => `<option value="${c.id}" ${selected === c.id ? "selected" : ""}>${esc((c.icone || "") + " " + c.nom)}</option>`).join("")}`;
+
+  root.innerHTML = `
+    <h2>Cartes de révision</h2>
+
+    <h3>Cours</h3>
+    <p style="font-size:.82rem;">Les élèves voient ces cours quand ils ouvrent « Cartes de révision » (seuls ceux qui contiennent des cartes pour leur classe).</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Cours</th><th>Cartes</th><th>Visible</th><th></th></tr></thead>
+      <tbody>${coursCache.map(c => `
+        <tr><td>${esc((c.icone || "") + " " + c.nom)}</td><td>${c.nb_cartes}</td>
+        <td>${c.id ? (c.actif ? "Oui" : "Masqué") : "—"}</td>
+        <td>${c.id ? `<button class="btn secondary" data-cours-edit="${c.id}" style="padding:4px 10px;">Éditer</button>
+          <button class="btn ghost" data-cours-del="${c.id}" style="color:var(--coral);">Suppr.</button>` : `<span style="font-size:.8rem;">affichées dans « Autres »</span>`}</td></tr>`).join("")}
+      </tbody>
+    </table></div>
+    <button class="btn secondary" id="btn-new-cours" style="margin-top:10px;">+ Nouveau cours</button>
+
+    <h3 style="margin-top:26px;">Cartes (${total})</h3>
+    <div class="card" style="display:flex;gap:8px;flex-wrap:wrap;">
+      <select id="f-classe"><option value="">Toutes les classes</option>${window.NEXI_CONFIG.CLASSES.map(cl => `<option value="${cl.code}" ${f.classe === cl.code ? "selected" : ""}>${cl.libelle}</option>`).join("")}</select>
+      <select id="f-cours">${optCours(f.cours, "Tous les cours")}<option value="__none" ${f.cours === "__none" ? "selected" : ""}>Sans cours</option></select>
+      <input id="f-search" placeholder="Rechercher…" value="${esc(f.search)}">
+      <button class="btn secondary" id="f-go">Filtrer</button>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th><input type="checkbox" id="chk-all"></th><th>Recto</th><th>Classe</th><th>Cours</th><th>Visible</th><th></th></tr></thead>
+      <tbody>${(cartes || []).map(c => `
+        <tr><td><input type="checkbox" class="chk" value="${c.id}"></td><td>${esc(c.recto)}</td><td>${esc(c.classe)}</td><td>${esc(c.cours_nom || "—")}</td>
+          <td><button class="btn secondary" data-toggle="${c.id}" style="padding:4px 10px;">${c.masque ? "Masquée" : "Visible"}</button></td>
+          <td style="white-space:nowrap;"><button class="btn secondary" data-cedit="${c.id}" style="padding:4px 10px;">Éditer</button>
+            <button class="btn ghost" data-del="${c.id}" style="color:var(--coral);">Suppr.</button></td></tr>`).join("") || `<tr><td colspan="6">Aucune carte.</td></tr>`}
+      </tbody>
+    </table></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+      <button class="btn secondary" id="pg-prev" ${f.page === 0 ? "disabled" : ""}>◀</button>
+      <span>Page ${f.page + 1} / ${pages}</span>
+      <button class="btn secondary" id="pg-next" ${f.page + 1 >= pages ? "disabled" : ""}>▶</button>
+      <span style="flex:1"></span>
+      <select id="bulk-cours"><option value="__none">Sans cours</option>${optCours("", "")}</select>
+      <button class="btn secondary" id="bulk-go">Déplacer la sélection</button>
+    </div>
+
+    <h3 style="margin-top:26px;">Ajouter une carte</h3>
+    <form id="form-c" class="card">
+      <div class="field"><label>Recto (question)</label><input id="c-recto" required></div>
+      <div class="field"><label>Verso — réponse</label><input id="c-reponse" required></div>
+      <div class="field"><label>Verso — explication détaillée</label><textarea id="c-expl"></textarea></div>
+      <div class="field"><label>Classe</label><select id="c-classe">${window.NEXI_CONFIG.CLASSES.map(cl => `<option value="${cl.code}">${cl.libelle}</option>`).join("")}</select></div>
+      <div class="field"><label>Cours</label><select id="c-cours"><option value="">Sans cours</option>${optCours("")}</select></div>
+      <button class="btn block" type="submit">Ajouter</button>
+    </form>
+
+    <h3 style="margin-top:26px;">Import en masse (classe entière, plusieurs cours)</h3>
+    <p style="font-size:.82rem;">Collez depuis Excel / Google Sheets, ou choisissez un fichier .csv. Colonnes dans l'ordre : <code>classe, cours, recto, verso, explication</code> (en-tête facultatif ; classe = code, ex. 4SC, 3Litt, 1erHP).</p>
+    <div class="card">
+      <textarea id="imp-txt" placeholder="classe&#9;cours&#9;recto&#9;verso&#9;explication"></textarea>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+        <input type="file" id="imp-file" accept=".csv,.tsv,.txt">
+        <select id="imp-mode"><option value="ajouter">Ajouter (ignorer les doublons)</option><option value="remplacer">Remplacer le contenu des cours concernés</option></select>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+        <button class="btn secondary" id="imp-check">Vérifier (rien n'est écrit)</button>
+        <button class="btn secondary" id="imp-tpl">Télécharger un modèle</button>
+      </div>
+      <div id="imp-rep" style="margin-top:12px;"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+        <button class="btn" id="imp-go" disabled>Importer maintenant</button>
+        <button class="btn ghost" id="imp-undo" style="display:none;color:var(--coral);">Annuler cet import</button>
+      </div>
+      <p id="imp-msg" style="font-size:.85rem;"></p>
+    </div>
+
+    <h3 style="margin-top:26px;">Import rapide — ancien format (une carte par ligne)</h3>
+    <p style="font-size:.82rem;">Format habituel <code>Recto:Réponse:Explication:Classe:Catégorie</code>, avec un 6ᵉ champ facultatif <code>:Cours</code> (créé s'il n'existe pas). Sans 6ᵉ champ, les catégories math / langue / svt sont rangées automatiquement dans Mathématiques / Langues / SVT.</p>
+    <form id="form-c-import" class="card">
+      <textarea id="c-import-text" placeholder="Capitale de la RDC ?:Kinshasa:Kinshasa est la capitale depuis 1966.:7EB:svt:Géographie"></textarea>
+      <button class="btn secondary block" type="submit" style="margin-top:10px;">Importer</button>
+    </form>
+  `;
+
+  // --- Cours : créer / éditer / supprimer
+  document.getElementById("btn-new-cours").addEventListener("click", () => openCoursModal(null));
+  root.querySelectorAll("[data-cours-edit]").forEach(b => b.addEventListener("click", () => openCoursModal(reels.find(c => c.id === b.dataset.coursEdit))));
+  root.querySelectorAll("[data-cours-del]").forEach(b => b.addEventListener("click", async () => {
+    const c = reels.find(x => x.id === b.dataset.coursDel);
+    if (!confirm(`Supprimer le cours « ${c.nom} » ? Ses ${c.nb_cartes} carte(s) seront conservées dans « Sans cours ».`)) return;
+    const { error } = await sb.rpc("admin_delete_cours", { p_token: tok(), p_id: c.id, p_supprimer_cartes: false });
+    if (error) return NexiGamify.toast(error.message, "error");
+    renderCartes();
+  }));
+
+  // --- Filtres, pagination
+  document.getElementById("f-go").addEventListener("click", () => {
+    cartesState.classe = document.getElementById("f-classe").value; cartesState.cours = document.getElementById("f-cours").value;
+    cartesState.search = document.getElementById("f-search").value.trim(); cartesState.page = 0; renderCartes();
+  });
+  document.getElementById("pg-prev").addEventListener("click", () => { cartesState.page--; renderCartes(); });
+  document.getElementById("pg-next").addEventListener("click", () => { cartesState.page++; renderCartes(); });
+
+  // --- Actions sur les cartes
+  root.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("Supprimer définitivement cette carte ?")) return;
+    const { error } = await sb.rpc("admin_delete_carte", { p_token: tok(), p_id: b.dataset.del });
+    if (error) return NexiGamify.toast(error.message, "error");
+    renderCartes();
+  }));
+  root.querySelectorAll("[data-cedit]").forEach(b => b.addEventListener("click", () => openCarteModal(cartes.find(x => x.id === b.dataset.cedit), reels)));
+  root.querySelectorAll("[data-toggle]").forEach(b => b.addEventListener("click", async () => {
+    const c = cartes.find(x => x.id === b.dataset.toggle);
+    const { error } = await sb.rpc("admin_upsert_carte_v2", { p_token: tok(), p_id: c.id, p_classe: c.classe, p_cours_id: c.cours_id, p_recto: c.recto, p_verso_reponse: c.verso_reponse, p_verso_explication: c.verso_explication, p_masque: !c.masque });
+    if (error) return NexiGamify.toast(error.message, "error");
+    renderCartes();
+  }));
+  document.getElementById("chk-all").addEventListener("change", e => root.querySelectorAll(".chk").forEach(c => { c.checked = e.target.checked; }));
+  document.getElementById("bulk-go").addEventListener("click", async () => {
+    const ids = [...root.querySelectorAll(".chk:checked")].map(c => c.value);
+    if (!ids.length) return NexiGamify.toast("Cochez d'abord des cartes.", "error");
+    const dest = document.getElementById("bulk-cours").value;
+    const { data, error } = await sb.rpc("admin_assigner_cours", { p_token: tok(), p_ids: ids, p_cours_id: dest === "__none" ? null : dest });
+    if (error) return NexiGamify.toast(error.message, "error");
+    NexiGamify.toast(`${data} carte(s) déplacée(s).`, "success"); renderCartes();
+  });
+  document.getElementById("form-c").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const { error } = await sb.rpc("admin_upsert_carte_v2", { p_token: tok(), p_id: null, p_classe: document.getElementById("c-classe").value, p_cours_id: document.getElementById("c-cours").value || null, p_recto: document.getElementById("c-recto").value, p_verso_reponse: document.getElementById("c-reponse").value, p_verso_explication: document.getElementById("c-expl").value || null, p_masque: false });
+    if (error) return NexiGamify.toast(error.message, "error");
+    NexiGamify.toast("Carte ajoutée.", "success"); renderCartes();
+  });
+
+  // --- Import rapide, ancien format (conservé à l'identique + cours facultatif)
+  document.getElementById("form-c-import").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const lines = document.getElementById("c-import-text").value.split("\n").map(l => l.trim()).filter(Boolean);
+    // La classe est un champ LIBRE ici : une faute de frappe créerait des cartes invisibles pour toujours.
+    const codesValides = new Set(window.NEXI_CONFIG.CLASSES.map(c => c.code));
+    const classesInconnues = new Set();
+    const nrm = t => (t || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
+    const parCategorie = { math: "mathematiques", langue: "langues", svt: "svt" };
+    const coursParNom = new Map(reels.map(c => [nrm(c.nom), c.id]));
+    const creations = new Map();
+    const coursExistantOuNouveau = (nom) => {
+      const k = nrm(nom);
+      if (coursParNom.has(k)) return Promise.resolve(coursParNom.get(k));
+      if (!creations.has(k)) creations.set(k, (async () => {
+        const { data, error } = await sb.rpc("admin_upsert_cours", { p_token: tok(), p_id: null, p_nom: nom.trim(), p_icone: null, p_ordre: 100, p_actif: true, p_categorie_nom: null });
+        if (error) throw error; coursParNom.set(k, data); return data;
+      })());
+      return creations.get(k);
+    };
+    const { ok, fail } = await runBatched(lines, async (line) => {
+      const [recto, reponse, expl, classe, cat, cours] = line.split(":");
+      if (!recto || !reponse) throw new Error("ligne invalide");
+      const classeTrim = (classe || "").trim();
+      if (!codesValides.has(classeTrim)) { classesInconnues.add(classeTrim || "(vide)"); throw new Error("classe inconnue : " + classeTrim); }
+      const { data: id, error } = await sb.rpc("admin_upsert_carte", { p_token: tok(), p_id: null, p_classe: classeTrim, p_categorie_nom: (cat || "général").trim(), p_recto: recto.trim(), p_verso_reponse: reponse.trim(), p_verso_explication: expl ? expl.trim() : null, p_masque: false });
+      if (error) throw error;
+      const cid = (cours || "").trim() ? await coursExistantOuNouveau(cours) : coursParNom.get(parCategorie[nrm(cat)]);
+      if (cid && id) { const r = await sb.rpc("admin_assigner_cours", { p_token: tok(), p_ids: [id], p_cours_id: cid }); if (r.error) throw r.error; }
+    });
+    if (classesInconnues.size) NexiGamify.toast(`${ok} importée(s), ${fail} rejetée(s) — classe(s) non reconnue(s) : ${[...classesInconnues].join(", ")}`, "error");
+    else NexiGamify.toast(`${ok} carte(s) importée(s)${fail ? `, ${fail} échec(s)` : ""}.`, fail ? "error" : "success");
+    renderCartes();
+  });
+
+  // --- Import en masse
+  document.getElementById("imp-file").addEventListener("change", async e => { const fl = e.target.files[0]; if (fl) document.getElementById("imp-txt").value = await fl.text(); });
+  document.getElementById("imp-tpl").addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(["\uFEFFclasse;cours;recto;verso;explication\n4SC;Chimie;Formule de l'eau ?;H2O;Deux atomes d'hydrogène et un d'oxygène\n"], { type: "text/csv" }));
+    a.download = "modele-cartes.csv"; a.click();
+  });
+  document.getElementById("imp-check").addEventListener("click", impVerifier);
+  document.getElementById("imp-go").addEventListener("click", impImporter);
+  document.getElementById("imp-undo").addEventListener("click", impAnnuler);
+}
+
+function openCoursModal(c) {
+  const modal = openModal(`
+    <h3>${c ? "Éditer" : "Nouveau"} cours</h3>
+    <div class="field"><label>Nom du cours</label><input id="co-nom" value="${c ? esc(c.nom) : ""}" placeholder="Ex. Chimie"></div>
+    <div class="field"><label>Icône (emoji, facultatif)</label><input id="co-ico" value="${c ? esc(c.icone || "") : ""}" placeholder="🧪"></div>
+    <div class="field"><label>Ordre d'affichage (petit = en premier)</label><input id="co-ord" type="number" value="${c ? c.ordre : 100}"></div>
+    <div class="field"><label>Catégorie liée (facultatif)</label><select id="co-cat">${["", "math", "langue", "svt", "spc"].map(v => `<option value="${v}" ${c && (c.categorie_nom || "") === v ? "selected" : ""}>${v || "Aucune"}</option>`).join("")}</select></div>
+    <div class="field"><label><input type="checkbox" id="co-act" ${!c || c.actif ? "checked" : ""}> Visible par les élèves</label></div>
+    <button class="btn block" id="co-save">Enregistrer</button>
+  `);
+  modal.querySelector("#co-save").addEventListener("click", async () => {
+    const { error } = await sb.rpc("admin_upsert_cours", { p_token: tok(), p_id: c ? c.id : null, p_nom: modal.querySelector("#co-nom").value, p_icone: modal.querySelector("#co-ico").value, p_ordre: parseInt(modal.querySelector("#co-ord").value, 10) || 100, p_actif: modal.querySelector("#co-act").checked, p_categorie_nom: modal.querySelector("#co-cat").value || null });
+    if (error) return NexiGamify.toast(error.message, "error");
+    modal.remove(); NexiGamify.toast("Enregistré.", "success"); renderCartes();
+  });
+}
+
+function openCarteModal(c, reels) {
+  const modal = openModal(`
+    <h3>Éditer la carte</h3>
+    <div class="field"><label>Recto (question)</label><textarea id="ce-recto">${esc(c.recto)}</textarea></div>
+    <div class="field"><label>Verso — réponse</label><textarea id="ce-rep">${esc(c.verso_reponse)}</textarea></div>
+    <div class="field"><label>Verso — explication détaillée</label><textarea id="ce-exp">${esc(c.verso_explication || "")}</textarea></div>
+    <div class="field"><label>Classe</label><select id="ce-classe">${window.NEXI_CONFIG.CLASSES.map(cl => `<option value="${cl.code}" ${c.classe === cl.code ? "selected" : ""}>${cl.libelle}</option>`).join("")}</select></div>
+    <div class="field"><label>Cours</label><select id="ce-cours"><option value="">Sans cours</option>${reels.map(r => `<option value="${r.id}" ${c.cours_id === r.id ? "selected" : ""}>${esc((r.icone || "") + " " + r.nom)}</option>`).join("")}</select></div>
+    <div class="field"><label><input type="checkbox" id="ce-vis" ${c.masque ? "" : "checked"}> Visible par les élèves</label></div>
+    <button class="btn block" id="ce-save">Enregistrer</button>
+  `);
+  modal.querySelector("#ce-save").addEventListener("click", async () => {
+    const { error } = await sb.rpc("admin_upsert_carte_v2", { p_token: tok(), p_id: c.id, p_classe: modal.querySelector("#ce-classe").value, p_cours_id: modal.querySelector("#ce-cours").value || null, p_recto: modal.querySelector("#ce-recto").value, p_verso_reponse: modal.querySelector("#ce-rep").value, p_verso_explication: modal.querySelector("#ce-exp").value || null, p_masque: !modal.querySelector("#ce-vis").checked });
+    if (error) return NexiGamify.toast(error.message, "error");
+    modal.remove(); NexiGamify.toast("Carte enregistrée.", "success"); renderCartes();
+  });
+}
+
+async function impCall(args) {
+  for (let essai = 0; ; essai++) {
+    const { data, error } = await sb.rpc("admin_import_cartes", args);
+    if (!error) return data;
+    if (adminAuthFail(error)) throw new Error("session expirée");
+    if (essai >= 1) throw new Error(error.message);
+    await new Promise(r => setTimeout(r, 800));   // un seul nouvel essai (sans risque : l'import ignore les doublons)
+  }
+}
+
+async function impRun(apply) {
+  const mode = document.getElementById("imp-mode").value;
+  const out = { a_importer: 0, importees: 0, doublons: 0, nb_erreurs: 0, erreurs: [], nouveaux: new Set(), pairs: new Map() };
+  let faites = 0;
+  for (const part of NexiImport.chunk(impRecords, apply ? 200 : 500)) {
+    const r = await impCall({ p_token: tok(), p_rows: part, p_mode: mode, p_apply: apply, p_lot: impLot, p_creer_cours: true });
+    out.a_importer += r.a_importer; out.importees += r.importees; out.doublons += r.doublons; out.nb_erreurs += r.nb_erreurs;
+    r.erreurs.forEach(e => out.erreurs.length < 200 && out.erreurs.push(e));
+    r.nouveaux_cours.forEach(n => out.nouveaux.add(n));
+    r.resume.forEach(x => {
+      const k = x.classe + "|" + x.cours.toLowerCase(), o = out.pairs.get(k);
+      out.pairs.set(k, { classe: x.classe, cours: x.cours, nb: (o ? o.nb : 0) + x.nb, existantes: o ? o.existantes : x.existantes, nouveau: x.nouveau_cours && (!o || o.nouveau) });
+    });
+    faites += part.length;
+    document.getElementById("imp-msg").textContent = `${apply ? "Import" : "Vérification"} : ${faites} / ${impRecords.length} ligne(s)…`;
+  }
+  return out;
+}
+
+async function impVerifier() {
+  const t = document.getElementById("imp-txt").value;
+  if (!t.trim()) return;
+  const rep = document.getElementById("imp-rep"), msg = document.getElementById("imp-msg");
+  impRecords = NexiImport.toRecords(NexiImport.parseTable(t, NexiImport.detectDelim(t)));
+  impLot = crypto.randomUUID();
+  const bCheck = document.getElementById("imp-check"); bCheck.disabled = true;
+  document.getElementById("imp-go").disabled = true; document.getElementById("imp-undo").style.display = "none"; msg.textContent = "";
+  rep.textContent = "Vérification de " + impRecords.length + " ligne(s)…";
+  try {
+    const o = await impRun(false); msg.textContent = "";
+    const rem = document.getElementById("imp-mode").value === "remplacer";
+    const del = [...o.pairs.values()].reduce((s, x) => s + x.existantes, 0);
+    rep.innerHTML = `
+      <p><b>${impRecords.length}</b> ligne(s) lue(s) · <b style="color:var(--mint,#37E29A)">${o.a_importer}</b> à importer · <b>${o.doublons}</b> doublon(s) ignoré(s) · <b style="color:${o.nb_erreurs ? "var(--coral)" : "inherit"}">${o.nb_erreurs}</b> erreur(s)</p>
+      ${o.nouveaux.size ? `<p>Nouveaux cours qui seront créés : <b>${[...o.nouveaux].map(esc).join(", ")}</b><br><span style="font-size:.8rem;">Vérifiez l'orthographe : « Maths » et « Mathématiques » seraient deux cours différents.</span></p>` : ""}
+      ${rem ? `<p style="color:var(--coral);"><b>Mode « remplacer » :</b> ${del} carte(s) existante(s) de ces cours seront supprimées avant l'import.</p>` : ""}
+      <div class="table-wrap"><table><thead><tr><th>Classe</th><th>Cours</th><th>Cartes</th><th>Déjà en base</th></tr></thead><tbody>
+        ${[...o.pairs.values()].map(x => `<tr><td>${esc(x.classe)}</td><td>${esc(x.cours)}${x.nouveau ? " <i>(nouveau)</i>" : ""}</td><td>${x.nb}</td><td>${x.existantes}</td></tr>`).join("")}
+      </tbody></table></div>
+      ${o.erreurs.length ? `<details open><summary style="color:var(--coral);">Lignes ignorées</summary><div class="table-wrap"><table><tbody>${o.erreurs.map(e => `<tr><td>ligne ${e.ligne}</td><td>${esc(e.message)}</td></tr>`).join("")}</tbody></table></div></details>` : ""}`;
+    document.getElementById("imp-go").disabled = o.a_importer === 0;
+  } catch (e) { msg.textContent = ""; rep.innerHTML = `<p style="color:var(--coral);">Erreur : ${esc(e.message)}</p>`; }
+  bCheck.disabled = false;
+}
+
+async function impImporter() {
+  if (document.getElementById("imp-mode").value === "remplacer" && !confirm("Les cartes existantes des cours concernés vont être supprimées. Continuer ?")) return;
+  const msg = document.getElementById("imp-msg"), go = document.getElementById("imp-go");
+  go.disabled = true; document.getElementById("imp-check").disabled = true; msg.textContent = "Import en cours…";
+  try {
+    const o = await impRun(true);
+    msg.textContent = `Terminé : ${o.importees} carte(s) importée(s), ${o.doublons} doublon(s) ignoré(s), ${o.nb_erreurs} ligne(s) en erreur.`;
+    NexiGamify.toast(`${o.importees} carte(s) importée(s).`, "success");
+  } catch (e) { msg.textContent = "Interrompu : " + e.message + " — le lot déjà importé peut être annulé."; }
+  document.getElementById("imp-undo").style.display = "inline-block";
+  document.getElementById("imp-check").disabled = false;
+}
+
+async function impAnnuler() {
+  if (!confirm("Supprimer toutes les cartes créées par cet import ?")) return;
+  const { data, error } = await sb.rpc("admin_annuler_import", { p_token: tok(), p_lot: impLot });
+  if (error) return NexiGamify.toast(error.message, "error");
+  NexiGamify.toast(`${data} carte(s) supprimée(s).`, "success"); renderCartes();
 }
 
 // =========================================================
@@ -485,10 +848,6 @@ async function renderClassements() {
 async function renderDiagnostic() {
   root.innerHTML = `
     <h2>Diagnostic</h2>
-    <div class="card" id="diag-space" style="margin-bottom:18px;">
-      <h4 style="margin-top:0;">Espace de la base</h4>
-      <p>Chargement…</p>
-    </div>
     <p>Vérifie en direct la connexion à Supabase, les fonctions RPC et le
     stockage des photos. Relancez après toute modification du schéma ou
     des policies.</p>
@@ -496,43 +855,6 @@ async function renderDiagnostic() {
     <div id="diag-results" style="margin-top:18px;"></div>
   `;
   document.getElementById("btn-run-diag").addEventListener("click", runDiagnostic);
-  renderEspaceBase();
-}
-
-async function renderEspaceBase() {
-  const box = document.getElementById("diag-space");
-  if (!box) return;
-  const [u, t] = await Promise.all([
-    sb.rpc("admin_db_usage", { p_token: tok() }),
-    sb.rpc("admin_db_tables", { p_token: tok() })
-  ]);
-  if (u.error) {
-    box.innerHTML = `<h4 style="margin-top:0;">Espace de la base</h4>
-      <p style="color:var(--coral);">Indisponible : ${esc(u.error.message)}</p>
-      <p style="font-size:.82rem;">Le patch SQL d'archivage a-t-il été exécuté ?</p>`;
-    return;
-  }
-  const r = Array.isArray(u.data) ? u.data[0] : u.data;
-  const pct = Number(r.pourcentage) || 0;
-  const couleur = r.niveau === "critique" ? "var(--coral)" : r.niveau === "attention" ? "var(--gold)" : "var(--teal, #21c4b3)";
-  const message = r.niveau === "critique" ? "Archivez maintenant : le blocage approche."
-    : r.niveau === "attention" ? "Prévoyez l'archivage prochainement."
-    : "Marge confortable.";
-  const lignes = (t.data || []).slice(0, 8);
-  box.innerHTML = `
-    <h4 style="margin-top:0;">Espace de la base</h4>
-    <p style="margin:6px 0;"><b>${esc(r.taille_lisible)}</b> utilisés sur 500 Mo (offre gratuite) — <b style="color:${couleur};">${pct} %</b></p>
-    <div style="height:10px; border-radius:6px; background:rgba(255,255,255,.12); overflow:hidden;">
-      <div style="height:100%; width:${Math.min(100, pct)}%; background:${couleur};"></div>
-    </div>
-    <p style="font-size:.85rem; margin:8px 0 0;">${esc(message)}</p>
-    <p style="font-size:.78rem; color:var(--text-dim);">Mesure approximative de la taille totale de la base (tables système incluses) ; vérifiez la valeur officielle dans Supabase > Settings > Usage.</p>
-    ${lignes.length ? `
-      <div class="table-wrap" style="margin-top:10px;"><table>
-        <thead><tr><th>Table</th><th>Taille</th><th>Lignes</th></tr></thead>
-        <tbody>${lignes.map(x => `<tr><td>${esc(x.nom_table)}</td><td>${esc(x.taille)}</td><td>${x.lignes}</td></tr>`).join("")}</tbody>
-      </table></div>` : ""}
-  `;
 }
 
 async function runDiagnostic() {
@@ -562,7 +884,8 @@ async function runDiagnostic() {
   await test("RPC admin — admin_list_eleves", async () => (await sb.rpc("admin_list_eleves", { p_token: tok(), p_limit: 1 })));
   await test("RPC admin — admin_list_defis", async () => (await sb.rpc("admin_list_defis", { p_token: tok() })));
   await test("RPC admin — admin_list_affinites", async () => (await sb.rpc("admin_list_affinites", { p_token: tok() })));
-  await test("RPC admin — admin_list_cartes", async () => (await sb.rpc("admin_list_cartes", { p_token: tok() })));
+  await test("RPC admin — admin_list_cours (cartes par cours)", async () => (await sb.rpc("admin_list_cours", { p_token: tok() })));
+  await test("RPC admin — admin_list_cartes_v2", async () => (await sb.rpc("admin_list_cartes_v2", { p_token: tok(), p_limit: 1 })));
   await test("RPC classement (rpc_classement, portée globale)", async () => (await sb.rpc("rpc_classement", { p_scope: "global", p_ecole_id: null, p_classe: null, p_limit: 1, p_offset: 0 })));
 
   await test("Stockage — upload test dans le bucket \"avatars\"", async () => {
@@ -577,11 +900,14 @@ async function runDiagnostic() {
   // ---- Cohérence des données : classes avec élèves mais sans contenu publié ----
   const { data: eleves } = await sb.rpc("admin_list_eleves", { p_token: tok(), p_limit: 1000 });
   const { data: defis } = await sb.rpc("admin_list_defis", { p_token: tok() });
-  const { data: cartes } = await sb.rpc("admin_list_cartes", { p_token: tok() });
-  if (eleves && defis && cartes) {
+  if (eleves && defis) {
     const classesAvecEleves = [...new Set(eleves.filter(e => e.valide).map(e => e.classe))];
     const classesAvecDefiPublie = new Set(defis.filter(d => d.publie).map(d => d.classe));
-    const classesAvecCarteVisible = new Set(cartes.filter(c => !c.masque).map(c => c.classe));
+    const comptes = await Promise.all(classesAvecEleves.map(async classe => {
+      const r = await sb.from("cartes_revision").select("id", { count: "exact", head: true }).eq("classe", classe).eq("masque", false);
+      return [classe, (r.count || 0) > 0];
+    }));
+    const classesAvecCarteVisible = new Set(comptes.filter(([, ok]) => ok).map(([c]) => c));
     classesAvecEleves.forEach(classe => {
       const hasDefi = classesAvecDefiPublie.has(classe);
       const hasCarte = classesAvecCarteVisible.has(classe);
@@ -628,3 +954,6 @@ async function renderReglages() {
     NexiGamify.toast("Mot de passe mis à jour.", "success");
   });
 }
+
+// Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
+if (session && session.role === "admin") render("eleves");

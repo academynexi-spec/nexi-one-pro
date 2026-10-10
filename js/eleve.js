@@ -154,13 +154,6 @@ async function renderDefisListe() {
 async function startQuiz(defiId) {
   const { data: questions, error } = await sb.rpc("rpc_questions_defi", { p_defi_id: defiId });
   if (error || !questions || !questions.length) { NexiGamify.toast("Ce défi n'a pas encore de questions.", "error"); return; }
-  // Sécurité : accepte aussi des options reçues sous forme de texte JSON
-  questions.forEach(q => {
-    if (!Array.isArray(q.options)) {
-      try { const p = typeof q.options === "string" ? JSON.parse(q.options) : []; q.options = Array.isArray(p) ? p : []; }
-      catch (e) { q.options = []; }
-    }
-  });
   let idx = 0, reponses = [], timerInterval;
 
   function renderQuestion() {
@@ -326,9 +319,9 @@ async function renderAffinites() {
 }
 
 // ---------------------------------------------------------
-// CARTES DE RÉVISION
+// CARTES DE RÉVISION — ancien affichage (conservé comme filet de sécurité)
 // ---------------------------------------------------------
-async function renderCartes() {
+async function renderCartesLegacy() {
   const { data: cartes, error } = await sb.from("cartes_revision").select("*, categories(nom)").eq("classe", session.classe).eq("masque", false);
   if (error) console.error("cartes_revision:", error);
   if (!cartes || !cartes.length) {
@@ -359,6 +352,133 @@ async function renderCartes() {
     document.getElementById("c-prev").addEventListener("click", () => { idx--; renderCard(); });
     document.getElementById("c-next").addEventListener("click", () => { idx++; renderCard(); });
   }
+  renderCard();
+}
+
+// ---------------------------------------------------------
+// CARTES DE RÉVISION PAR COURS
+// L'élève voit d'abord les cours de sa classe, puis les cartes du cours choisi.
+// Tant que le patch SQL « cours et import » n'est pas appliqué (ou si l'appel
+// échoue), on retombe sur l'ancien affichage : jamais pire qu'avant.
+// ---------------------------------------------------------
+function isMissingFn(error) {
+  const m = (error?.message || "").toLowerCase();
+  return error?.code === "PGRST202" || m.includes("could not find the function") || m.includes("schema cache");
+}
+
+function ensureCoursCss() {
+  if (document.getElementById("nexi-cours-css")) return;
+  const st = document.createElement("style");
+  st.id = "nexi-cours-css";
+  st.textContent = `
+    .cours-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-top:14px}
+    .cours-tile{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;min-height:118px;padding:14px 10px;
+      border-radius:18px;border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.12);color:inherit;font:inherit;cursor:pointer;
+      text-align:center;-webkit-tap-highlight-color:transparent;transition:transform .15s ease,border-color .15s ease,background .15s ease}
+    .cours-tile:hover,.cours-tile:focus-visible{border-color:#29F1E0;background:rgba(41,241,224,.10);outline:none}
+    .cours-tile:active{transform:scale(.96)}
+    .cours-tile .ico{font-size:2rem;line-height:1}
+    .cours-tile .nom{font-weight:700;word-break:break-word}
+    .cours-tile .nb{font-size:.8rem;opacity:.7}
+    .cours-back{margin-bottom:8px}
+    @media (prefers-reduced-motion:reduce){.cours-tile{transition:none}}`;
+  document.head.appendChild(st);
+}
+
+async function renderCartes() {
+  ensureCoursCss();
+  const { data: cours, error } = await sb.rpc("rpc_cours_classe", { p_eleve_id: session.id, p_token: session.token });
+  if (error) {
+    if (isAuthError(error)) return handleAuthError();
+    if (!isMissingFn(error)) console.error("rpc_cours_classe:", error);
+    return renderCartesLegacy();
+  }
+  if (!cours || !cours.length) {
+    root.innerHTML = `<div class="empty-state"><h4>Pas encore de cartes</h4><p>Aucune carte visible pour la classe <b>${escapeHtml(session.classe || "—")}</b> pour l'instant. Reviens bientôt !</p></div>`;
+    return;
+  }
+  root.innerHTML = `
+    <h2>Cartes de révision</h2>
+    <p style="text-align:center; color:var(--text-dim);">Choisis un cours</p>
+    <div class="cours-grid">
+      ${cours.map((c, i) => `
+        <button type="button" class="cours-tile" data-i="${i}">
+          <span class="ico">${escapeHtml(c.icone || "📘")}</span>
+          <span class="nom">${escapeHtml(c.nom)}</span>
+          <span class="nb">${c.nb_cartes} carte${c.nb_cartes > 1 ? "s" : ""}</span>
+        </button>`).join("")}
+    </div>`;
+  root.querySelectorAll("[data-i]").forEach(el => el.addEventListener("click", () => {
+    window.NexiGamify && NexiGamify.playSound("click");
+    ouvrirCours(cours[Number(el.dataset.i)]);
+  }));
+}
+
+async function ouvrirCours(c) {
+  ensureCoursCss();
+  root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
+  // Lecture par pages de 500 (jusqu'à 5000 cartes par cours et par classe).
+  let cartes = [];
+  for (let page = 0; page < 10; page++) {
+    const { data, error } = await sb.rpc("rpc_cartes_cours", { p_eleve_id: session.id, p_token: session.token, p_cours_id: c.id, p_limit: 500, p_offset: page * 500 });
+    if (error) {
+      if (isAuthError(error)) return handleAuthError();
+      console.error("rpc_cartes_cours:", error);
+      root.innerHTML = `<div class="empty-state"><h4>Erreur de chargement</h4><p>${escapeHtml(error.message || "")}</p><button class="btn secondary" id="c-back">← Les cours</button></div>`;
+      document.getElementById("c-back").addEventListener("click", renderCartes);
+      return;
+    }
+    cartes = cartes.concat(data || []);
+    if (!data || data.length < 500) break;
+  }
+  if (!cartes.length) { renderCartes(); return; }
+
+  let idx = 0, celebre = false, swipedAt = 0;
+  const go = (d) => { const n = idx + d; if (n < 0 || n >= cartes.length) return; idx = n; renderCard(); };
+  const onKey = (e) => {
+    if (!document.getElementById("flash")) { document.removeEventListener("keydown", onKey); return; }
+    if (e.key === "ArrowRight") go(1); else if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === " " || e.key === "Enter") { e.preventDefault(); flip(); }
+  };
+  const flip = () => {
+    const f = document.getElementById("flash"); if (!f) return;
+    f.classList.toggle("flipped");
+    if (f.classList.contains("flipped") && idx === cartes.length - 1 && !celebre && cartes.length > 1) {
+      celebre = true; bot && bot.reactBravo();   // dernier recto retourné : petite célébration
+    }
+  };
+  function renderCard() {
+    const k = cartes[idx];
+    root.innerHTML = `
+      <button class="btn secondary cours-back" id="c-back">← Les cours</button>
+      <h2>${escapeHtml((c.icone || "") + " " + c.nom)}</h2>
+      <p style="text-align:center; color:var(--text-dim);">${idx + 1} / ${cartes.length}</p>
+      <div class="flash-wrap">
+        <div class="flash-card" id="flash">
+          <div class="flash-face front">${escapeHtml(k.recto)}</div>
+          <div class="flash-face back">
+            <div class="reponse">${escapeHtml(k.verso_reponse)}</div>
+            ${k.verso_explication ? `<div class="explication">${escapeHtml(k.verso_explication)}</div>` : ""}
+          </div>
+        </div>
+      </div>
+      <div class="flash-nav">
+        <button class="btn secondary" id="c-prev" ${idx === 0 ? "disabled" : ""}>◀ Précédent</button>
+        <button class="btn secondary" id="c-next" ${idx === cartes.length - 1 ? "disabled" : ""}>Suivant ▶</button>
+      </div>`;
+    document.getElementById("c-back").addEventListener("click", () => { document.removeEventListener("keydown", onKey); renderCartes(); });
+    const flash = document.getElementById("flash");
+    flash.addEventListener("click", () => { if (Date.now() - swipedAt > 400) flip(); });
+    let x0 = 0, y0 = 0;
+    flash.addEventListener("touchstart", (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+    flash.addEventListener("touchend", (e) => {                      // glisser : carte suivante / précédente
+      const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) { swipedAt = Date.now(); go(dx < 0 ? 1 : -1); }
+    }, { passive: true });
+    document.getElementById("c-prev").addEventListener("click", () => go(-1));
+    document.getElementById("c-next").addEventListener("click", () => go(1));
+  }
+  document.addEventListener("keydown", onKey);
   renderCard();
 }
 
