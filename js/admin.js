@@ -53,6 +53,7 @@ function openModal(html) {
 async function render(view) {
   root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
   if (view === "eleves") return renderEleves();
+  if (view === "notifs") return renderNotifs();
   if (view === "defis") return renderDefis();
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
@@ -460,7 +461,7 @@ const NexiImport = (function () {
 
 const cartesState = { classe: "", cours: "", search: "", page: 0, pageSize: 50 };
 let coursCache = [];
-let impRecords = [], impLot = null;
+let impRecords = [], impLot = null, impDernier = null;
 
 async function renderCartes() {
   const { data: cours, error } = await sb.rpc("admin_list_cours", { p_token: tok() });
@@ -550,6 +551,7 @@ async function renderCartes() {
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
         <button class="btn" id="imp-go" disabled>Importer maintenant</button>
         <button class="btn ghost" id="imp-undo" style="display:none;color:var(--coral);">Annuler cet import</button>
+        <button class="btn secondary" id="imp-notif" style="display:none;">📣 Notifier les élèves</button>
       </div>
       <p id="imp-msg" style="font-size:.85rem;"></p>
     </div>
@@ -656,6 +658,7 @@ async function renderCartes() {
   document.getElementById("imp-check").addEventListener("click", impVerifier);
   document.getElementById("imp-go").addEventListener("click", impImporter);
   document.getElementById("imp-undo").addEventListener("click", impAnnuler);
+  document.getElementById("imp-notif").addEventListener("click", impNotifier);
 }
 
 function openCoursModal(c) {
@@ -729,7 +732,7 @@ async function impVerifier() {
   impRecords = NexiImport.toRecords(NexiImport.parseTable(t, NexiImport.detectDelim(t)));
   impLot = crypto.randomUUID();
   const bCheck = document.getElementById("imp-check"); bCheck.disabled = true;
-  document.getElementById("imp-go").disabled = true; document.getElementById("imp-undo").style.display = "none"; msg.textContent = "";
+  document.getElementById("imp-go").disabled = true; document.getElementById("imp-undo").style.display = "none"; document.getElementById("imp-notif").style.display = "none"; msg.textContent = "";
   rep.textContent = "Vérification de " + impRecords.length + " ligne(s)…";
   try {
     const o = await impRun(false); msg.textContent = "";
@@ -751,13 +754,14 @@ async function impVerifier() {
 async function impImporter() {
   if (document.getElementById("imp-mode").value === "remplacer" && !confirm("Les cartes existantes des cours concernés vont être supprimées. Continuer ?")) return;
   const msg = document.getElementById("imp-msg"), go = document.getElementById("imp-go");
-  go.disabled = true; document.getElementById("imp-check").disabled = true; msg.textContent = "Import en cours…";
+  go.disabled = true; document.getElementById("imp-check").disabled = true; msg.textContent = "Import en cours…"; impDernier = null;
   try {
-    const o = await impRun(true);
+    const o = await impRun(true); impDernier = o;
     msg.textContent = `Terminé : ${o.importees} carte(s) importée(s), ${o.doublons} doublon(s) ignoré(s), ${o.nb_erreurs} ligne(s) en erreur.`;
     NexiGamify.toast(`${o.importees} carte(s) importée(s).`, "success");
   } catch (e) { msg.textContent = "Interrompu : " + e.message + " — le lot déjà importé peut être annulé."; }
   document.getElementById("imp-undo").style.display = "inline-block";
+  if (impDernier && impDernier.importees > 0) document.getElementById("imp-notif").style.display = "inline-block";
   document.getElementById("imp-check").disabled = false;
 }
 
@@ -766,6 +770,90 @@ async function impAnnuler() {
   const { data, error } = await sb.rpc("admin_annuler_import", { p_token: tok(), p_lot: impLot });
   if (error) return NexiGamify.toast(error.message, "error");
   NexiGamify.toast(`${data} carte(s) supprimée(s).`, "success"); renderCartes();
+}
+
+// =========================================================
+// NOTIFICATIONS (admin) — onglet ajouté par le script, aucune modification de admin.html
+// =========================================================
+function injectNotifTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="notifs"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "notifs"; b.textContent = "🔔 Notifications";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("notifs");
+  });
+  tabs.appendChild(b);
+}
+
+async function renderNotifs() {
+  const { data: liste, error } = await sb.rpc("admin_list_notifications", { p_token: tok(), p_limit: 50 });
+  if (error) {
+    if (adminAuthFail(error)) return;
+    root.innerHTML = isMissingFn(error)
+      ? `<div class="empty-state"><h4>Notifications non activées</h4><p>Exécutez d'abord le patch SQL « notifications » dans Supabase.</p></div>`
+      : `<div class="empty-state"><h4>Erreur</h4><p>${esc(error.message || "")}</p></div>`;
+    return;
+  }
+  const ICONES = { defi: "🎯", cartes: "🗂️", message: "📢" };
+  const quand = (iso) => new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+  root.innerHTML = `
+    <h2>Notifications</h2>
+    <p style="font-size:.82rem;">Les élèves voient une pastille 🔔 dans l'app. Un message « Nouveau défi » part automatiquement quand vous publiez un défi ; pour les cartes, utilisez le bouton « Notifier » après un import.</p>
+    <form id="form-n" class="card">
+      <div class="field"><label>Destinataires</label><select id="n-classe"><option value="">Tous les élèves</option>${window.NEXI_CONFIG.CLASSES.map(c => `<option value="${c.code}">${c.libelle}</option>`).join("")}</select></div>
+      <div class="field"><label>Type</label><select id="n-type"><option value="message">📢 Message</option><option value="cartes">🗂️ Nouvelles cartes</option><option value="defi">🎯 Défi</option></select></div>
+      <div class="field"><label>Titre (80 caractères max)</label><input id="n-titre" maxlength="80" required></div>
+      <div class="field"><label>Message (facultatif, 300 caractères max)</label><textarea id="n-corps" maxlength="300"></textarea></div>
+      <button class="btn block" type="submit">Envoyer</button>
+    </form>
+    <h3 style="margin-top:26px;">Historique</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Pour</th><th>Notification</th><th>Vu par</th><th></th></tr></thead>
+      <tbody>${(liste || []).map(n => `
+        <tr><td>${quand(n.created_at)}</td><td>${n.classe ? esc(n.classe) : "Tous"}</td>
+        <td>${ICONES[n.type] || "🔔"} <b>${esc(n.titre)}</b>${n.corps ? `<br><small>${esc(n.corps)}</small>` : ""}</td>
+        <td>${n.nb_vues} / ${n.nb_destinataires}</td>
+        <td><button class="btn ghost" data-ndel="${n.id}" style="color:var(--coral);">Suppr.</button></td></tr>`).join("") || `<tr><td colspan="5">Aucune notification envoyée.</td></tr>`}
+      </tbody>
+    </table></div>`;
+  document.getElementById("form-n").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const { error: err } = await sb.rpc("admin_envoyer_notification", {
+      p_token: tok(), p_classe: document.getElementById("n-classe").value || null, p_titre: document.getElementById("n-titre").value,
+      p_corps: document.getElementById("n-corps").value || null, p_type: document.getElementById("n-type").value
+    });
+    if (err) { if (adminAuthFail(err)) return; return NexiGamify.toast(err.message, "error"); }
+    NexiGamify.toast("Notification envoyée.", "success"); renderNotifs();
+  });
+  root.querySelectorAll("[data-ndel]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("Supprimer cette notification ? Elle disparaîtra aussi chez les élèves.")) return;
+    const { error: err } = await sb.rpc("admin_supprimer_notification", { p_token: tok(), p_id: b.dataset.ndel });
+    if (err) return NexiGamify.toast(err.message, "error");
+    renderNotifs();
+  }));
+}
+
+// Bouton « Notifier » après un import de cartes : une notification par classe concernée
+async function impNotifier() {
+  if (!impDernier) return;
+  const parClasse = {};
+  for (const x of impDernier.pairs.values()) (parClasse[x.classe] = parClasse[x.classe] || []).push(x.cours);
+  let envoyees = 0;
+  for (const [classe, cours] of Object.entries(parClasse)) {
+    const { error } = await sb.rpc("admin_envoyer_notification", {
+      p_token: tok(), p_classe: classe, p_titre: "Nouvelles cartes de révision",
+      p_corps: ("À réviser : " + [...new Set(cours)].join(", ")).slice(0, 300), p_type: "cartes"
+    });
+    if (error) {
+      if (adminAuthFail(error)) return;
+      return NexiGamify.toast(isMissingFn(error) ? "Activez d'abord le patch SQL des notifications." : error.message, "error");
+    }
+    envoyees++;
+  }
+  document.getElementById("imp-notif").style.display = "none";
+  NexiGamify.toast(`${envoyees} classe(s) notifiée(s).`, "success");
 }
 
 // =========================================================
@@ -956,4 +1044,4 @@ async function renderReglages() {
 }
 
 // Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
-if (session && session.role === "admin") render("eleves");
+if (session && session.role === "admin") { injectNotifTab(); render("eleves"); }

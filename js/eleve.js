@@ -28,7 +28,7 @@ function handleAuthError() {
   setTimeout(() => NexiAuth.logout(), 1500);
 }
 
-async function init() { bot = mountNexiBot(document.body); render("profil"); }
+async function init() { bot = mountNexiBot(document.body); render("profil"); initNotifs(); }
 
 async function render(view) {
   root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
@@ -37,6 +37,7 @@ async function render(view) {
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
   if (view === "classement") return renderClassement();
+  if (view === "notifs") return renderNotifs();
 }
 
 // ---------------------------------------------------------
@@ -480,6 +481,109 @@ async function ouvrirCours(c) {
   }
   document.addEventListener("keydown", onKey);
   renderCard();
+}
+
+// ---------------------------------------------------------
+// NOTIFICATIONS — cloche à côté du bouton de déconnexion, compteur, liste.
+// Totalement silencieux tant que le patch SQL « notifications » n'est pas appliqué.
+// ---------------------------------------------------------
+let notifsCount = 0, notifsBell = null;
+
+function ensureNotifsCss() {
+  if (document.getElementById("nexi-notif-css")) return;
+  const st = document.createElement("style");
+  st.id = "nexi-notif-css";
+  st.textContent = `
+    .notif-bell{position:relative}
+    .notif-fab{position:fixed;left:14px;bottom:88px;z-index:50;border-radius:50%;width:46px;height:46px;padding:0}
+    .notif-badge{position:absolute;top:-5px;right:-5px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#FF5D6C;color:#fff;
+      font-size:.7rem;font-weight:700;line-height:18px;text-align:center;box-sizing:border-box}
+    .notif-badge[hidden]{display:none}
+    .notif-list{display:grid;gap:10px;margin-top:14px}
+    .notif-item{display:flex;gap:12px;align-items:flex-start;width:100%;text-align:left;padding:12px 14px;border-radius:16px;
+      border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.12);color:inherit;font:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
+    .notif-item.new{border-color:#29F1E0;background:rgba(41,241,224,.10)}
+    .notif-item .ico{font-size:1.5rem;line-height:1.2}
+    .notif-item .txt{display:flex;flex-direction:column;gap:2px;min-width:0}
+    .notif-item .txt small{opacity:.8;word-break:break-word}
+    .notif-item .txt em{font-size:.75rem;opacity:.6;font-style:normal}`;
+  document.head.appendChild(st);
+}
+
+function dateRelative(iso) {
+  const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (min < 1) return "à l'instant";
+  if (min < 60) return `il y a ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const j = Math.floor(h / 24);
+  if (j === 1) return "hier";
+  if (j < 7) return `il y a ${j} jours`;
+  return new Date(iso).toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+}
+
+function setNotifsBadge(n, annoncer) {
+  if (annoncer && n > notifsCount) NexiGamify.toast(`🔔 ${n - notifsCount > 1 ? "Nouvelles notifications" : "Nouvelle notification"}`, "success");
+  notifsCount = n;
+  if (!notifsBell) return;
+  const b = notifsBell.querySelector(".notif-badge");
+  b.textContent = n > 9 ? "9+" : String(n);
+  b.hidden = n <= 0;
+}
+
+async function rafraichirNotifs() {
+  if (document.hidden || !notifsBell) return;
+  const { data, error } = await sb.rpc("rpc_notifs_non_lues", { p_eleve_id: session.id, p_token: session.token });
+  if (error) { if (isAuthError(error)) handleAuthError(); return; }
+  setNotifsBadge(Number(data) || 0, true);
+}
+
+async function initNotifs() {
+  const { data, error } = await sb.rpc("rpc_notifs_non_lues", { p_eleve_id: session.id, p_token: session.token });
+  if (error) return;                         // patch absent (ou erreur) : pas de cloche, rien ne change
+  ensureNotifsCss();
+  const logout = document.getElementById("btn-logout");
+  const bell = document.createElement("button");
+  bell.type = "button";
+  bell.className = (logout && logout.className) || "btn secondary";
+  bell.classList.add("notif-bell");
+  bell.setAttribute("aria-label", "Notifications");
+  bell.innerHTML = `🔔<span class="notif-badge" hidden></span>`;
+  bell.addEventListener("click", () => { setActiveNav(""); render("notifs"); });
+  if (logout && logout.parentNode) logout.parentNode.insertBefore(bell, logout);
+  else { bell.classList.add("notif-fab"); document.body.appendChild(bell); }
+  notifsBell = bell;
+  setNotifsBadge(Number(data) || 0, false);
+  if (notifsCount > 0) NexiGamify.toast(`🔔 ${notifsCount} nouvelle${notifsCount > 1 ? "s" : ""} notification${notifsCount > 1 ? "s" : ""}`, "success");
+  setInterval(rafraichirNotifs, 60000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) rafraichirNotifs(); });
+}
+
+async function renderNotifs() {
+  ensureNotifsCss();
+  const { data, error } = await sb.rpc("rpc_mes_notifs", { p_eleve_id: session.id, p_token: session.token, p_limit: 30 });
+  if (error) {
+    if (isAuthError(error)) return handleAuthError();
+    root.innerHTML = `<div class="empty-state"><h4>Erreur de chargement</h4><p>${escapeHtml(error.message || "")}</p></div>`;
+    return;
+  }
+  const liste = data || [], ICONES = { defi: "🎯", cartes: "🗂️", message: "📢" };
+  root.innerHTML = `<h2>Notifications</h2>` + (liste.length
+    ? `<div class="notif-list">${liste.map((n, i) => `
+        <button type="button" class="notif-item${n.nouvelle ? " new" : ""}" data-i="${i}">
+          <span class="ico">${ICONES[n.type] || "🔔"}</span>
+          <span class="txt"><b>${escapeHtml(n.titre)}</b>${n.corps ? `<small>${escapeHtml(n.corps)}</small>` : ""}<em>${dateRelative(n.created_at)}</em></span>
+        </button>`).join("")}</div>`
+    : `<div class="empty-state"><h4>Aucune notification</h4><p>Les nouveautés de ta classe apparaîtront ici.</p></div>`);
+  root.querySelectorAll("[data-i]").forEach(el => el.addEventListener("click", () => {
+    const n = liste[Number(el.dataset.i)];
+    if (n.type === "defi") { setActiveNav("defis"); render("defis"); }
+    else if (n.type === "cartes") { setActiveNav("cartes"); render("cartes"); }
+  }));
+  if (liste.some(n => n.nouvelle)) {                  // l'affichage garde la mise en évidence ; le compteur retombe à 0
+    const r = await sb.rpc("rpc_notifs_marquer_lues", { p_eleve_id: session.id, p_token: session.token });
+    if (!r.error) setNotifsBadge(0, false);
+  }
 }
 
 // ---------------------------------------------------------
