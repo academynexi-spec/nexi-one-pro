@@ -42,81 +42,69 @@ function showInstallBanner() {
 }
 
 // =========================================================
-// Upload de la photo de profil (Supabase Storage, bucket "avatars")
-// - La photo est recadrée au carré, réduite (384 px max) et convertie en WebP
-//   (≈ 10 à 40 Ko), au lieu d'envoyer la photo brute du téléphone (2 à 6 Mo).
-// - Chemin FIXE par élève : changer de photo REMPLACE l'ancienne au lieu de
-//   s'accumuler dans le stockage.
-// - L'URL renvoyée contient "?v=<horodatage>" pour contourner le cache du CDN.
+// Photo de profil (Supabase Storage, bucket "avatars")
+//  - réduite à 512 px et recompressée en JPEG avant l'envoi : quelques dizaines de Ko
+//    au lieu de plusieurs Mo (économise le stockage et les données mobiles des élèves) ;
+//  - l'ancienne photo est supprimée après remplacement (voir supprimerAncienAvatar).
 // =========================================================
-const AVATAR_MAX_SIDE = 384;          // pixels
-const AVATAR_MAX_BYTES = 100 * 1024;  // 100 Ko visés
-
-async function loadImageSource_(file) {
-  try {
-    return await createImageBitmap(file, { imageOrientation: "from-image" });
-  } catch (e) {
-    // Navigateur sans cette option : repli sur <img> (respecte aussi l'orientation EXIF)
-    return await new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image illisible.")); };
-      img.src = url;
-    });
-  }
+function cheminAvatar(url) {
+  const m = /\/avatars\/([^?#]+)/.exec(url || "");
+  return m ? decodeURIComponent(m[1]) : null;
 }
 
-async function compressAvatar(file) {
-  if (!file || !file.type || !file.type.startsWith("image/")) {
-    throw new Error("Le fichier choisi n'est pas une image.");
-  }
-  const src = await loadImageSource_(file);
-  const w0 = src.width, h0 = src.height;
-  const side = Math.min(w0, h0);                       // recadrage carré centré
-  const sx = Math.round((w0 - side) / 2), sy = Math.round((h0 - side) / 2);
-  const out = Math.max(1, Math.min(AVATAR_MAX_SIDE, side));
-  const canvas = document.createElement("canvas");
-  canvas.width = out; canvas.height = out;
-  canvas.getContext("2d").drawImage(src, sx, sy, side, side, 0, 0, out, out);
-  if (src.close) src.close();
+function chargerImage(file) {
+  return new Promise((resolve, reject) => {
+    const u = URL.createObjectURL(file), img = new Image();
+    img.onload = () => { URL.revokeObjectURL(u); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(u); reject(new Error("format d'image non pris en charge")); };
+    img.src = u;
+  });
+}
 
-  const toBlob = (type, q) => new Promise(res => canvas.toBlob(res, type, q));
-
-  // 1) WebP, qualité décroissante jusqu'à passer sous la taille cible
+async function compresserImage(file, cote = 512) {
+  const img = await chargerImage(file);
+  const ratio = Math.min(1, cote / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * ratio)), h = Math.max(1, Math.round(img.naturalHeight * ratio));
+  const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);   // fond blanc : un PNG transparent reste lisible en JPEG
+  ctx.drawImage(img, 0, 0, w, h);                     // l'orientation EXIF est appliquée par le navigateur
   let blob = null;
-  for (const q of [0.85, 0.75, 0.65, 0.55, 0.45]) {
-    blob = await toBlob("image/webp", q);
-    if (!blob || blob.type !== "image/webp") break;    // WebP non encodable par ce navigateur
-    if (blob.size <= AVATAR_MAX_BYTES) return blob;
+  for (const q of [0.82, 0.7, 0.6]) {
+    blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", q));
+    if (blob && blob.size <= 150 * 1024) break;
   }
-  // 2) Repli JPEG (anciens navigateurs)
-  for (const q of [0.8, 0.7, 0.6, 0.5, 0.4]) {
-    blob = await toBlob("image/jpeg", q);
-    if (blob && blob.size <= AVATAR_MAX_BYTES) return blob;
-  }
-  throw new Error("Image trop lourde, même après compression. Essayez une autre photo.");
+  if (!blob) throw new Error("compression impossible");
+  return blob;
 }
 
 async function uploadAvatar(file, eleveId) {
   const sb = getSupabase();
-  let blob;
-  try {
-    blob = await compressAvatar(file);
-  } catch (err) {
-    console.error("compression avatar:", err);
-    NexiGamify.toast(err.message || "Impossible de préparer la photo.", "error");
+  let corps;
+  try { corps = await compresserImage(file); }
+  catch (e) {
+    console.error("compression avatar:", e);
+    NexiGamify.toast(`Photo illisible (${e.message}). Essaie une photo JPEG ou PNG.`, "error");
     return null;
   }
-  const path = `${eleveId}/avatar`;   // chemin fixe : remplace l'ancienne photo
-  const { error } = await sb.storage.from("avatars").upload(path, blob, {
-    upsert: true, contentType: blob.type, cacheControl: "3600"
-  });
+  const path = `${eleveId}/${Date.now()}.jpg`;
+  const { error } = await sb.storage.from("avatars").upload(path, corps, { upsert: true, contentType: "image/jpeg", cacheControl: "31536000" });
   if (error) {
     console.error("upload avatar:", error);
     NexiGamify.toast(`Échec de l'envoi : ${error.message || "vérifiez les policies du bucket avatars"}`, "error");
     return null;
   }
   const { data } = sb.storage.from("avatars").getPublicUrl(path);
-  return data.publicUrl + "?v=" + Date.now();
+  return data.publicUrl;
+}
+
+// Supprime l'ancienne photo une fois la nouvelle enregistrée. Sans gravité en cas d'échec :
+// le panneau admin « Stockage » nettoie les photos remplacées. (La base n'autorise de toute façon
+// que la suppression de photos qu'aucun élève n'utilise.)
+async function supprimerAncienAvatar(ancienneUrl, nouvelleUrl, eleveId) {
+  try {
+    const nom = cheminAvatar(ancienneUrl);
+    if (!nom || ancienneUrl === nouvelleUrl || !nom.startsWith(eleveId + "/")) return;
+    await getSupabase().storage.from("avatars").remove([nom]);
+  } catch (e) { /* ignoré */ }
 }

@@ -54,6 +54,8 @@ async function render(view) {
   root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
   if (view === "eleves") return renderEleves();
   if (view === "notifs") return renderNotifs();
+  if (view === "stockage") return renderStockage();
+  if (view === "tournois") return renderTournois();
   if (view === "defis") return renderDefis();
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
@@ -857,6 +859,549 @@ async function impNotifier() {
 }
 
 // =========================================================
+// STOCKAGE, SÉCURITÉ ET ARCHIVAGE INTELLIGENT — onglet « 📦 Stockage »
+// Rien n'est supprimé sans archive vérifiée ; tout est restaurable.
+// =========================================================
+const NexiArchive = (function () {
+  const enc = new TextEncoder(), dec = new TextDecoder(), MAGIC = [0x4e, 0x58, 0x41, 0x31];   // "NXA1" = archive chiffrée
+
+  function fmt(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " o";
+    const u = ["Ko", "Mo", "Go", "To"]; let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < 3);
+    return (n >= 100 ? String(Math.round(n)) : n.toFixed(1).replace(".", ",")) + " " + u[i];
+  }
+  async function lire(stream) { return new Uint8Array(await new Response(stream).arrayBuffer()); }
+  async function gzip(bytes) {
+    if (typeof CompressionStream === "undefined") return bytes;
+    const cs = new CompressionStream("gzip"), w = cs.writable.getWriter(); w.write(bytes); w.close(); return lire(cs.readable);
+  }
+  async function gunzip(bytes) {
+    const ds = new DecompressionStream("gzip"), w = ds.writable.getWriter(); w.write(bytes); w.close(); return lire(ds.readable);
+  }
+  async function sha256Hex(bytes) {
+    const h = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return Array.from(h, b => b.toString(16).padStart(2, "0")).join("");
+  }
+  async function cle(phrase, salt) {
+    const base = await crypto.subtle.importKey("raw", enc.encode(phrase), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  async function emballer(obj, phrase) {
+    const data = await gzip(enc.encode(JSON.stringify(obj)));
+    if (!phrase) return data;
+    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await cle(phrase, salt), data));
+    const out = new Uint8Array(32 + ct.length); out.set(MAGIC, 0); out.set(salt, 4); out.set(iv, 20); out.set(ct, 32);
+    return out;
+  }
+  const estChiffre = b => b.length > 32 && MAGIC.every((m, i) => b[i] === m);
+  async function deballer(bytes, phrase) {
+    let data = bytes;
+    if (estChiffre(bytes)) {
+      if (!phrase) throw new Error("PHRASE_REQUISE");
+      try { data = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(20, 32) }, await cle(phrase, bytes.slice(4, 20)), bytes.slice(32))); }
+      catch (e) { throw new Error("Phrase secrète incorrecte ou fichier abîmé."); }
+    }
+    if (data[0] === 0x1f && data[1] === 0x8b) data = await gunzip(data);
+    return JSON.parse(dec.decode(data));
+  }
+  function blobEnB64(blob) {
+    return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1] || ""); r.onerror = () => rej(new Error("lecture impossible")); r.readAsDataURL(blob); });
+  }
+  function b64EnBytes(b64) { const s = atob(b64), o = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) o[i] = s.charCodeAt(i); return o; }
+  function telecharger(bytes, nom) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" })); a.download = nom; a.click();
+  }
+  function compter(obj) { const t = (obj && obj.tables) || {}; return Object.values(t).reduce((s, l) => s + (Array.isArray(l) ? l.length : 0), 0); }
+
+  // Photo → JPEG 512 px (même logique que côté élève)
+  async function compresserImage(blob, cote = 512) {
+    const img = await new Promise((res, rej) => { const u = URL.createObjectURL(blob), i = new Image(); i.onload = () => { URL.revokeObjectURL(u); res(i); }; i.onerror = () => { URL.revokeObjectURL(u); rej(new Error("image illisible")); }; i.src = u; });
+    const r = Math.min(1, cote / Math.max(img.naturalWidth, img.naturalHeight)), w = Math.max(1, Math.round(img.naturalWidth * r)), h = Math.max(1, Math.round(img.naturalHeight * r));
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, w, h); x.drawImage(img, 0, 0, w, h);
+    let out = null;
+    for (const q of [0.82, 0.7, 0.6]) { out = await new Promise(rs => c.toBlob(rs, "image/jpeg", q)); if (out && out.size <= 150 * 1024) break; }
+    if (!out) throw new Error("compression impossible");
+    return out;
+  }
+
+  function courbeSVG(histo) {
+    if (!histo || histo.length < 2) return `<p style="font-size:.85rem;">L'historique se construit au fil des jours (un point par jour) : ouvrez ce panneau régulièrement.</p>`;
+    const W = 600, H = 150, P = 6, max = Math.max(...histo.map(h => Math.max(h.db, h.fichiers)), 1);
+    const x = i => P + (W - 2 * P) * (i / (histo.length - 1)), y = v => H - P - (H - 2 * P) * (v / max);
+    const ligne = k => histo.map((h, i) => `${x(i).toFixed(1)},${y(h[k]).toFixed(1)}`).join(" ");
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;" role="img" aria-label="Évolution du stockage">
+      <polyline fill="none" stroke="#29F1E0" stroke-width="2" points="${ligne("db")}"/><polyline fill="none" stroke="#8B7CFF" stroke-width="2" points="${ligne("fichiers")}"/></svg>
+      <div style="font-size:.78rem;display:flex;gap:14px;flex-wrap:wrap;"><span style="color:#29F1E0;">● Base de données</span><span style="color:#8B7CFF;">● Photos</span>
+      <span>${histo[0].jour} → ${histo[histo.length - 1].jour} · maximum ${fmt(max)}</span></div>`;
+  }
+  // Jours restants avant saturation au rythme observé (30 derniers points), ou null
+  function joursAvantSaturation(histo, k, quota) {
+    const h = (histo || []).slice(-30); if (h.length < 2) return null;
+    const jours = (new Date(h[h.length - 1].jour) - new Date(h[0].jour)) / 86400000;
+    const pente = (h[h.length - 1][k] - h[0][k]) / jours;
+    if (!(jours > 0) || !(pente > 0)) return null;
+    return Math.max(0, Math.ceil((quota - h[h.length - 1][k]) / pente));
+  }
+  return { fmt, gzip, gunzip, sha256Hex, emballer, deballer, blobEnB64, b64EnBytes, telecharger, compter, compresserImage, courbeSVG, joursAvantSaturation };
+})();
+
+function injectStockageTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="stockage"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "stockage"; b.textContent = "📦 Stockage";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("stockage");
+  });
+  tabs.appendChild(b);
+  rafraichirPastilleStockage();
+}
+
+// À chaque ouverture du panel : enregistre le point du jour et signale un problème sur l'onglet
+async function rafraichirPastilleStockage() {
+  const { data, error } = await sb.rpc("admin_stockage_etat", { p_token: tok() });
+  if (error || !data) return;
+  const b = document.querySelector('.admin-tabs [data-view="stockage"]');
+  if (b) b.textContent = "📦 Stockage" + (data.niveau === "critique" ? " 🔴" : data.niveau === "attention" ? " 🟠" : "");
+}
+
+const stCheminAvatar = (url) => { const m = /\/avatars\/([^?#]+)/.exec(url || ""); return m ? decodeURIComponent(m[1]) : null; };
+
+async function stExecuter(btn, fn) {
+  const msg = document.getElementById("st-msg");
+  if (btn) btn.disabled = true;
+  try { await fn(msg); }
+  catch (e) { if (!adminAuthFail(e)) NexiGamify.toast(e.message || String(e), "error"); msg.textContent = "Interrompu : " + (e.message || e); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function renderStockage() {
+  const { data: s, error } = await sb.rpc("admin_stockage_etat", { p_token: tok() });
+  if (error) {
+    if (adminAuthFail(error)) return;
+    root.innerHTML = isMissingFn(error)
+      ? `<div class="empty-state"><h4>Suivi du stockage non activé</h4><p>Exécutez d'abord le patch SQL « stockage » dans Supabase.</p></div>`
+      : `<div class="empty-state"><h4>Erreur</h4><p>${esc(error.message || "")}</p></div>`;
+    return;
+  }
+  const A = NexiArchive, COUL = { ok: "#37E29A", info: "#29F1E0", attention: "#FFC857", critique: "#FF5D6C" }, ICO = { ok: "✅", info: "ℹ️", attention: "⚠️", critique: "🔴" };
+  const niv = p => p >= s.seuils.critique ? "critique" : p >= s.seuils.attention ? "attention" : "ok";
+  const barre = (titre, pct, utilise, quota, extra) => `
+    <div style="margin:12px 0;"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>${titre}</b><span>${A.fmt(utilise)} / ${A.fmt(quota)} — ${pct} %</span></div>
+    <div style="height:12px;border-radius:6px;background:rgba(127,127,127,.25);overflow:hidden;margin-top:4px;"><div style="height:100%;width:${Math.min(100, pct)}%;background:${COUL[niv(pct)]};"></div></div>
+    ${extra ? `<div style="font-size:.78rem;opacity:.8;margin-top:3px;">${extra}</div>` : ""}</div>`;
+  const jDb = A.joursAvantSaturation(s.historique, "db", s.quota_db), jF = A.joursAvantSaturation(s.historique, "fichiers", s.quota_fichiers);
+  const duree = j => j > 3650 ? "plus de 10 ans" : j > 730 ? `environ ${Math.round(j / 365)} ans` : j > 60 ? `environ ${Math.round(j / 30)} mois` : `${j} jour(s)`;
+  const proj = [jF != null ? `photos : ${duree(jF)}` : null, jDb != null ? `base : ${duree(jDb)}` : null].filter(Boolean);
+  const critiques = (s.securite || []).filter(x => x.niveau === "critique");
+
+  const sug = [];
+  if (s.orphelines.n > 0) sug.push({ gain: s.orphelines.octets, action: "orph", bouton: "Nettoyer", titre: `Supprimer ${s.orphelines.n} ancienne(s) photo(s) remplacée(s)`, detail: `Plus utilisées par aucun élève. Libère ${A.fmt(s.orphelines.octets)}.` });
+  if (s.lourdes.n > 0) sug.push({ gain: s.lourdes.octets * 0.9, action: "opt", bouton: "Alléger", titre: `Alléger ${s.lourdes.n} photo(s) lourde(s)`, detail: `Réduites à 512 px, même visage. Gain estimé : ${A.fmt(s.lourdes.octets * 0.9)}.` });
+  if (s.inactifs.n > 0) sug.push({ gain: s.inactifs.octets, action: "arch", bouton: "Préparer l'archive", titre: `Archiver ${s.inactifs.n} élève(s) désactivé(s)`, detail: `Données et photos enregistrées dans un fichier, vérifié, puis retirées de la base. Restaurables. Environ ${A.fmt(s.inactifs.octets)}.` });
+  sug.sort((a, b) => b.gain - a.gain);
+  const confortable = Math.max(s.pct_db, s.pct_fichiers) < s.seuils.attention;
+  const QUAND = iso => new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+  const STATUT = { genere: "À vérifier", verifie: "Vérifiée", purge: "Espace libéré", restaure: "Restaurée" };
+
+  root.innerHTML = `
+    <h2>Stockage et sécurité</h2>
+    ${critiques.length ? `<div class="card" style="border:1px solid ${COUL.critique};"><b style="color:${COUL.critique};">🔴 À traiter en priorité</b>${critiques.map(c => `<p style="margin:6px 0;"><b>${esc(c.titre)}</b><br><span style="font-size:.85rem;">${esc(c.detail)}</span></p>`).join("")}</div>` : ""}
+    ${s.depasse_gratuit ? `<div class="card" style="border:1px solid ${COUL.attention};">Vos données dépassent les limites du plan gratuit. <b>Si vous êtes passé au plan Pro, sélectionnez « Pro » ci-dessous</b> : les seuils d'alerte se recalculent.</div>` : ""}
+
+    <div class="card">
+      ${barre("Base de données", s.pct_db, s.db_octets, s.quota_db, `dont vos données Nexi : ${A.fmt(s.db_public_octets)} (le reste est le système de Supabase)`)}
+      ${barre("Photos de profil", s.pct_fichiers, s.fichiers_octets, s.quota_fichiers, `${s.nb_fichiers} fichier(s) · ${s.nb_eleves} élève(s)`)}
+      ${proj.length ? `<p style="font-size:.85rem;">Au rythme actuel, saturation dans ${proj.join(" · ")}.</p>` : ""}
+      <p style="font-size:.78rem;opacity:.8;">Le transfert sortant (5 Go/mois en gratuit) n'est pas mesurable ici : consultez <i>Settings › Usage</i> dans Supabase. Les photos allégées le réduisent aussi.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px;">
+        <label>Plan Supabase :</label>
+        <select id="st-plan"><option value="gratuit" ${s.plan === "gratuit" ? "selected" : ""}>Gratuit</option><option value="pro" ${s.plan === "pro" ? "selected" : ""}>Pro</option></select>
+        <button class="btn secondary" id="st-plan-save">Enregistrer</button>
+      </div>
+      <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:.85rem;">Quotas personnalisés (facultatif)</summary>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
+          <input id="st-q-db" type="number" min="1" placeholder="Base (Mo)" value="${s.quota_db_perso ? Math.round(s.quota_db / 1048576) : ""}">
+          <input id="st-q-f" type="number" min="1" placeholder="Photos (Mo)" value="${s.quota_fichiers_perso ? Math.round(s.quota_fichiers / 1048576) : ""}">
+        </div><p style="font-size:.78rem;">Laissez vide pour utiliser les valeurs standard du plan.</p></details>
+    </div>
+
+    <h3 style="margin-top:22px;">Évolution</h3><div class="card">${A.courbeSVG(s.historique)}</div>
+
+    <h3 style="margin-top:22px;">Sécurité</h3>
+    <div class="card">${(s.securite || []).map(x => `<p style="margin:8px 0;">${ICO[x.niveau] || "•"} <b>${esc(x.titre)}</b><br><span style="font-size:.85rem;opacity:.85;">${esc(x.detail)}</span></p>`).join("")}</div>
+
+    <h3 style="margin-top:22px;">${confortable ? "Optimisations facultatives" : "Libérer de l'espace — sans rien perdre"}</h3>
+    ${confortable ? `<p style="font-size:.85rem;">Vous avez largement la place (${Math.max(s.pct_db, s.pct_fichiers)} %). Ces actions sont facultatives.</p>` : `<p style="font-size:.85rem;">Classées par gain d'espace. Les défis passés comptent dans le classement : ils ne sont jamais archivés.</p>`}
+    ${sug.length ? sug.map(x => `<div class="card" style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;"><div style="min-width:220px;"><b>${esc(x.titre)}</b><br><span style="font-size:.85rem;">${esc(x.detail)}</span></div><button class="btn secondary" data-st-act="${x.action}">${x.bouton}</button></div>`).join("") : `<div class="card">Rien à optimiser pour le moment. 👌</div>`}
+
+    <h3 style="margin-top:22px;">Sauvegarde et archives</h3>
+    <div class="card">
+      <div class="field"><label>Phrase secrète (facultative) — chiffre le fichier. Notez-la : sans elle, le fichier est illisible.</label><input id="st-pass" type="password" autocomplete="new-password"></div>
+      <label style="display:block;margin:6px 0;"><input type="checkbox" id="st-photos" checked> Inclure les photos dans la sauvegarde complète</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn" id="st-backup">⬇️ Télécharger une sauvegarde complète</button>
+        <button class="btn secondary" id="st-restore">♻️ Restaurer depuis une archive…</button>
+      </div>
+      <p id="st-msg" style="font-size:.85rem;margin-top:10px;"></p>
+      <input type="file" id="st-file" accept=".nxa,.json,.gz" style="display:none;">
+    </div>
+    ${(s.journal || []).length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Contenu</th><th>Taille</th><th>État</th><th></th></tr></thead><tbody>
+      ${s.journal.map(j => `<tr><td>${QUAND(j.created_at)}</td><td>${j.portee === "sauvegarde_complete" ? "Sauvegarde complète" : "Élèves désactivés"}${j.chiffre ? " 🔒" : ""}</td>
+        <td>${j.portee === "sauvegarde_complete" ? `${j.nb_lignes} ligne(s)` : `${j.nb_eleves} élève(s), ${j.nb_lignes} ligne(s), ${j.nb_photos} photo(s)`}</td><td>${A.fmt(j.taille)}</td>
+        <td>${j.portee === "sauvegarde_complete" ? "—" : STATUT[j.statut] || j.statut}</td>
+        <td style="white-space:nowrap;">${j.portee !== "eleves_inactifs" ? "" : j.statut === "genere" ? `<button class="btn secondary" data-st-verif="${j.id}" style="padding:4px 10px;">Vérifier le fichier</button>` : j.statut === "verifie" ? `<button class="btn" data-st-purge="${j.id}" style="padding:4px 10px;">Libérer l'espace</button>` : ""}</td></tr>`).join("")}
+      </tbody></table></div>` : ""}`;
+
+  const $ = id => document.getElementById(id);
+  $("st-plan-save").addEventListener("click", ev => stExecuter(ev.currentTarget, async () => {
+    const { error: e } = await sb.rpc("admin_stockage_config_set", { p_token: tok(), p_plan: $("st-plan").value, p_quota_db_mo: parseInt($("st-q-db").value, 10) || null, p_quota_fichiers_mo: parseInt($("st-q-f").value, 10) || null });
+    if (e) throw new Error(e.message);
+    NexiGamify.toast("Plan enregistré : les seuils sont recalculés.", "success"); renderStockage();
+  }));
+  root.querySelectorAll("[data-st-act]").forEach(b => b.addEventListener("click", ev => stExecuter(ev.currentTarget, async () => {
+    const a = b.dataset.stAct;
+    if (a === "orph") await stNettoyerOrphelines(s.orphelines);
+    else if (a === "opt") await stOptimiserPhotos();
+    else if (a === "arch") await stArchiverGenerer();
+  })));
+  $("st-backup").addEventListener("click", ev => stExecuter(ev.currentTarget, stSauvegardeComplete));
+  let mode = "";
+  const choisir = m => { mode = m; $("st-file").value = ""; $("st-file").click(); };
+  $("st-restore").addEventListener("click", () => choisir("restaurer"));
+  root.querySelectorAll("[data-st-verif]").forEach(b => b.addEventListener("click", () => choisir("verifier")));
+  root.querySelectorAll("[data-st-purge]").forEach(b => b.addEventListener("click", ev => stExecuter(ev.currentTarget, () => stArchiverLiberer(b.dataset.stPurge))));
+  $("st-file").addEventListener("change", ev => {
+    const f = ev.target.files[0]; if (!f) return;
+    stExecuter(null, () => mode === "restaurer" ? stArchiveRestaurer(f) : stArchiveVerifier(f));
+  });
+}
+
+// ----- 1) Supprimer les photos remplacées (plus utilisées par aucun élève)
+async function stNettoyerOrphelines(prevu) {
+  const msg = document.getElementById("st-msg");
+  if (prevu && !confirm(`Supprimer ${prevu.n} ancienne(s) photo(s) remplacée(s) (${NexiArchive.fmt(prevu.octets)}) ? Aucune n'est utilisée par un élève.`)) return { total: 0, octets: 0 };
+  let total = 0, octets = 0;
+  for (let tour = 0; tour < 200; tour++) {
+    const { data: liste, error } = await sb.rpc("admin_photos_a_traiter", { p_token: tok(), p_type: "orphelines", p_limit: 100 });
+    if (error) throw new Error(error.message);
+    if (!liste || !liste.length) break;
+    const noms = liste.map(p => p.nom);
+    const { data: suppr, error: e2 } = await sb.storage.from("avatars").remove(noms);
+    if (e2) throw new Error(e2.message);
+    if (!suppr || !suppr.length) throw new Error("suppression refusée par la base : exécutez le patch SQL « stockage »");
+    total += suppr.length;
+    octets += liste.filter(p => suppr.some(x => x.name === p.nom)).reduce((s, p) => s + Number(p.octets || 0), 0);
+    msg.textContent = `${total} photo(s) supprimée(s)…`;
+    if (suppr.length < noms.length) break;
+  }
+  if (prevu) { NexiGamify.toast(`${total} photo(s) supprimée(s) — ${NexiArchive.fmt(octets)} libérés.`, "success"); renderStockage(); }
+  return { total, octets };
+}
+
+// ----- 2) Alléger les photos lourdes (même photo, 512 px)
+async function stOptimiserPhotos() {
+  const msg = document.getElementById("st-msg"), vus = new Set();
+  if (!confirm("Alléger les photos lourdes ? Chaque photo est réduite à 512 px (qualité visuelle conservée) et remplace l'originale.")) return;
+  let faites = 0, gagnes = 0, echecs = 0;
+  for (let tour = 0; tour < 50; tour++) {
+    const { data: liste, error } = await sb.rpc("admin_photos_a_traiter", { p_token: tok(), p_type: "lourdes", p_limit: 20 });
+    if (error) throw new Error(error.message);
+    const nouvelles = (liste || []).filter(p => !vus.has(p.nom));
+    if (!nouvelles.length) break;
+    for (const p of nouvelles) {
+      vus.add(p.nom);
+      try {
+        const rep = await fetch(p.url); if (!rep.ok) throw new Error("téléchargement impossible");
+        const leger = await NexiArchive.compresserImage(await rep.blob());
+        if (leger.size >= Number(p.octets)) continue;
+        const chemin = `${p.eleve_id}/${Date.now()}.jpg`;
+        const up = await sb.storage.from("avatars").upload(chemin, leger, { upsert: true, contentType: "image/jpeg", cacheControl: "31536000" });
+        if (up.error) throw up.error;
+        const url = sb.storage.from("avatars").getPublicUrl(chemin).data.publicUrl;
+        const { error: e3 } = await sb.rpc("admin_set_avatar", { p_token: tok(), p_eleve_id: p.eleve_id, p_url: url });
+        if (e3) throw new Error(e3.message);
+        await sb.storage.from("avatars").remove([p.nom]);   // l'ancienne est devenue orpheline
+        faites++; gagnes += Number(p.octets) - leger.size;
+      } catch (e) { echecs++; console.error("photo", p.nom, e); }
+      msg.textContent = `${faites} photo(s) allégée(s)${echecs ? `, ${echecs} échec(s)` : ""}…`;
+    }
+  }
+  NexiGamify.toast(`${faites} photo(s) allégée(s) — ${NexiArchive.fmt(gagnes)} libérés${echecs ? `, ${echecs} échec(s)` : ""}.`, echecs ? "error" : "success");
+  renderStockage();
+}
+
+// ----- utilitaires d'archive
+async function stPhotosDe(eleves, msg) {
+  const photos = [], manquantes = [];
+  let i = 0;
+  for (const e of eleves) {
+    i++; const nom = stCheminAvatar(e.avatar_url); if (!nom) continue;
+    msg.textContent = `Photos : ${i} / ${eleves.length}…`;
+    try {
+      const rep = await fetch(e.avatar_url); if (!rep.ok) throw new Error("absente");
+      const blob = await rep.blob();
+      photos.push({ nom, type: blob.type || "image/jpeg", b64: await NexiArchive.blobEnB64(blob) });
+    } catch (err) { manquantes.push(nom); }
+  }
+  return { photos, manquantes };
+}
+
+// ----- 3a) Archiver : générer le fichier (rien n'est encore retiré de la base)
+async function stArchiverGenerer() {
+  const msg = document.getElementById("st-msg"), phrase = document.getElementById("st-pass").value;
+  const { data: cands, error } = await sb.rpc("admin_archive_candidats", { p_token: tok(), p_limit: 500 });
+  if (error) throw new Error(error.message);
+  if (!cands.length) { NexiGamify.toast("Aucun élève désactivé à archiver.", "success"); return; }
+  const apercu = cands.slice(0, 15).map(c => `${c.identifiant} (${c.classe || "—"})`).join(", ");
+  if (!confirm(`Préparer l'archive de ${cands.length} élève(s) désactivé(s) :\n${apercu}${cands.length > 15 ? "…" : ""}\n\nÉtape 1/3 : un fichier va être téléchargé. Rien n'est encore retiré de la base.`)) return;
+  const ids = cands.map(c => c.id), tables = { eleves: [], defi_resultats: [], affinites_reponses: [] };
+  for (const part of NexiImport.chunk(ids, 25)) {
+    const { data, error: e2 } = await sb.rpc("admin_archive_donnees", { p_token: tok(), p_ids: part });
+    if (e2) throw new Error(e2.message);
+    for (const k of Object.keys(tables)) tables[k].push(...(data[k] || []));
+    msg.textContent = `Lecture des données : ${tables.eleves.length} / ${ids.length} élève(s)…`;
+  }
+  const { photos, manquantes } = await stPhotosDe(tables.eleves, msg);
+  const obj = { format: "nexi-archive", version: 1, portee: "eleves_inactifs", cree_le: new Date().toISOString(), ids, tables, photos };
+  msg.textContent = "Compression" + (phrase ? " et chiffrement" : "") + "…";
+  const bytes = await NexiArchive.emballer(obj, phrase), sha = await NexiArchive.sha256Hex(bytes);
+  const { error: e3 } = await sb.rpc("admin_archive_enregistrer", { p_token: tok(), p_portee: "eleves_inactifs", p_ids: ids, p_sha256: sha, p_taille: bytes.length, p_nb_lignes: NexiArchive.compter(obj), p_nb_photos: photos.length, p_chiffre: !!phrase });
+  if (e3) throw new Error(e3.message);
+  NexiArchive.telecharger(bytes, `nexi-archive-eleves-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}.nxa`);
+  NexiGamify.toast(`Archive créée (${NexiArchive.fmt(bytes.length)}). Étape 2/3 : vérifiez le fichier téléchargé.`, "success");
+  if (manquantes.length) alert(`${manquantes.length} photo(s) étaient introuvables et ne sont pas dans l'archive (sans conséquence sur les données).`);
+  renderStockage();
+}
+
+// ----- 3b) Vérifier : on ré-ouvre le fichier téléchargé et on le compare à ce qui a été enregistré
+async function stArchiveVerifier(file) {
+  const phrase = document.getElementById("st-pass").value, bytes = new Uint8Array(await file.arrayBuffer());
+  let obj;
+  try { obj = await NexiArchive.deballer(bytes, phrase); }
+  catch (e) { throw new Error(e.message === "PHRASE_REQUISE" ? "Ce fichier est chiffré : saisissez la phrase secrète dans le champ prévu, puis recommencez." : e.message); }
+  const sha = await NexiArchive.sha256Hex(bytes);
+  const { data, error } = await sb.rpc("admin_archive_verifier", { p_token: tok(), p_sha256: sha, p_nb_lignes: NexiArchive.compter(obj) });
+  if (error) throw new Error(error.message);
+  NexiGamify.toast(`Fichier vérifié ✔ (${data.nb_eleves} élève(s), ${data.nb_photos} photo(s)). Étape 3/3 : vous pouvez libérer l'espace.`, "success");
+  renderStockage();
+}
+
+// ----- 3c) Libérer l'espace : seulement pour une archive vérifiée
+async function stArchiverLiberer(id) {
+  if ((prompt("Les comptes archivés vont être retirés de la base (leurs données sont dans votre fichier vérifié, restaurables).\nTapez ARCHIVER pour confirmer.") || "").trim() !== "ARCHIVER") return;
+  const { data, error } = await sb.rpc("admin_archive_purger", { p_token: tok(), p_id: id });
+  if (error) throw new Error(error.message);
+  const ph = await stNettoyerOrphelines(null);   // les photos des comptes archivés deviennent orphelines : on les retire
+  NexiGamify.toast(`${data.eleves} élève(s) archivé(s), ${NexiArchive.fmt(ph.octets)} de photos libérés.`, "success");
+  renderStockage();
+}
+
+// ----- 4) Restaurer depuis une archive
+async function stArchiveRestaurer(file) {
+  const msg = document.getElementById("st-msg"), phrase = document.getElementById("st-pass").value;
+  let obj;
+  try { obj = await NexiArchive.deballer(new Uint8Array(await file.arrayBuffer()), phrase); }
+  catch (e) { throw new Error(e.message === "PHRASE_REQUISE" ? "Ce fichier est chiffré : saisissez la phrase secrète dans le champ prévu, puis recommencez." : e.message); }
+  if (obj.format !== "nexi-archive") throw new Error("Ce fichier n'est pas une archive d'élèves (une sauvegarde complète sert de copie de secours).");
+  const T = obj.tables, parEleve = (liste) => { const m = {}; (liste || []).forEach(r => (m[r.eleve_id] = m[r.eleve_id] || []).push(r)); return m; };
+  const res = parEleve(T.defi_resultats), aff = parEleve(T.affinites_reponses);
+  let restaures = 0, deja = 0, ignores = [], idsRestaures = new Set();
+  for (const part of NexiImport.chunk(T.eleves || [], 20)) {
+    const donnees = { eleves: part, defi_resultats: part.flatMap(e => res[e.id] || []), affinites_reponses: part.flatMap(e => aff[e.id] || []) };
+    const { data, error } = await sb.rpc("admin_archive_restaurer", { p_token: tok(), p_donnees: donnees });
+    if (error) throw new Error(error.message);
+    restaures += data.eleves_restaures; deja += data.deja_presents; ignores = ignores.concat(data.eleves_ignores || []);
+    (data.ids_restaures || []).forEach(i => idsRestaures.add(i));
+    msg.textContent = `Restauration : ${restaures + deja + ignores.length} / ${T.eleves.length} élève(s)…`;
+  }
+  let photos = 0;
+  for (const p of obj.photos || []) {
+    if (!idsRestaures.has(p.nom.split("/")[0])) continue;
+    const up = await sb.storage.from("avatars").upload(p.nom, new Blob([NexiArchive.b64EnBytes(p.b64)], { type: p.type }), { upsert: true, contentType: p.type, cacheControl: "31536000" });
+    if (!up.error) photos++;
+  }
+  const sha = await NexiArchive.sha256Hex(new Uint8Array(await file.arrayBuffer()));
+  await sb.rpc("admin_archive_marquer_restaure", { p_token: tok(), p_sha256: sha });
+  const detail = `${restaures} élève(s) restauré(s), ${deja} déjà présent(s), ${photos} photo(s)`;
+  if (ignores.length) alert(`${detail}.\n\nNon restaurés :\n` + ignores.map(i => `• ${i.identifiant} : ${i.motif}`).join("\n"));
+  NexiGamify.toast(detail + ".", ignores.length ? "error" : "success");
+  renderStockage();
+}
+
+// ----- 5) Sauvegarde complète (aucune suppression)
+async function stSauvegardeComplete() {
+  const msg = document.getElementById("st-msg"), phrase = document.getElementById("st-pass").value, avecPhotos = document.getElementById("st-photos").checked;
+  const noms = ["ecoles", "superviseurs", "classes_ref", "eleves", "categories", "defis", "defi_questions", "defi_resultats", "affinites_questions", "affinites_reponses", "cartes_revision", "cours_revision", "notifications"];
+  const tables = {};
+  for (const t of noms) {
+    tables[t] = [];
+    for (let off = 0; ; off += 500) {
+      const { data, error } = await sb.rpc("admin_export_table", { p_token: tok(), p_table: t, p_offset: off, p_limit: 500 });
+      if (error) throw new Error(error.message);
+      tables[t].push(...data); msg.textContent = `Lecture de « ${t} » : ${tables[t].length} ligne(s)…`;
+      if (data.length < 500) break;
+    }
+  }
+  const photos = avecPhotos ? (await stPhotosDe(tables.eleves, msg)).photos : [];
+  const obj = { format: "nexi-sauvegarde", version: 1, cree_le: new Date().toISOString(), tables, photos };
+  msg.textContent = "Compression" + (phrase ? " et chiffrement" : "") + "…";
+  const bytes = await NexiArchive.emballer(obj, phrase), sha = await NexiArchive.sha256Hex(bytes);
+  const { error } = await sb.rpc("admin_archive_enregistrer", { p_token: tok(), p_portee: "sauvegarde_complete", p_ids: null, p_sha256: sha, p_taille: bytes.length, p_nb_lignes: NexiArchive.compter(obj), p_nb_photos: photos.length, p_chiffre: !!phrase });
+  if (error) throw new Error(error.message);
+  NexiArchive.telecharger(bytes, `nexi-sauvegarde-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}.nxa`);
+  NexiGamify.toast(`Sauvegarde téléchargée (${NexiArchive.fmt(bytes.length)}). Gardez-la en lieu sûr.`, "success");
+  renderStockage();
+}
+
+// =========================================================
+// TOURNOIS INTER-ÉCOLES (admin) — onglet « 🏆 Tournois » ajouté par le script
+// =========================================================
+function injectTournoiTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="tournois"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "tournois"; b.textContent = "🏆 Tournois";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("tournois");
+  });
+  tabs.appendChild(b);
+}
+
+const TN_STATUT = { brouillon: "Brouillon", a_venir: "À venir", en_cours: "En cours", termine: "Terminé" };
+const tnStatut = t => (!t.publie ? "brouillon" : t.statut);
+const tnQuand = iso => new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+const tnVersLocal = iso => { const d = new Date(iso), p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+let tnCache = { ecoles: [], defis: [] };
+
+async function renderTournois() {
+  const { data: liste, error } = await sb.rpc("admin_list_tournois", { p_token: tok() });
+  if (error) {
+    if (adminAuthFail(error)) return;
+    root.innerHTML = isMissingFn(error)
+      ? `<div class="empty-state"><h4>Tournois non activés</h4><p>Exécutez d'abord le patch SQL « tournois » dans Supabase.</p></div>`
+      : `<div class="empty-state"><h4>Erreur</h4><p>${esc(error.message || "")}</p></div>`;
+    return;
+  }
+  const [{ data: ecoles }, { data: defis }] = await Promise.all([sb.rpc("admin_list_ecoles", { p_token: tok() }), sb.rpc("admin_list_defis", { p_token: tok() })]);
+  tnCache = { ecoles: ecoles || [], defis: defis || [] };
+  const nomEcole = id => (tnCache.ecoles.find(e => e.id === id) || {}).nom || "?";
+  root.innerHTML = `
+    <h2>Tournois inter-écoles</h2>
+    <p style="font-size:.82rem;">Un tournoi réunit plusieurs écoles autour de défis réservés, sur une période donnée. Score d'une école = points de ses N meilleurs élèves ÷ N : équitable entre petites et grandes écoles.</p>
+    <button class="btn" id="tn-new">＋ Nouveau tournoi</button>
+    ${(liste || []).map(t => `
+      <div class="card" style="margin-top:12px;">
+        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>${esc(t.nom)}</b><span class="badge ${tnStatut(t) === "en_cours" ? "on" : ""}">${TN_STATUT[tnStatut(t)]}</span></div>
+        <p style="font-size:.85rem;margin:6px 0;">${tnQuand(t.date_debut)} → ${tnQuand(t.date_fin)} · ${t.classes ? esc(t.classes.join(", ")) : "toutes les classes"} · top ${t.top_n}</p>
+        <p style="font-size:.85rem;margin:6px 0;">${t.ecole_ids.length} école(s) : ${esc(t.ecole_ids.map(nomEcole).join(", ") || "—")} · ${t.defi_ids.length} défi(s)</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+          <button class="btn" data-tn-res="${t.id}">Résultats</button>
+          <button class="btn secondary" data-tn-edit="${t.id}">Éditer</button>
+          <button class="btn ghost" data-tn-del="${t.id}" style="color:var(--coral);">Supprimer</button></div>
+      </div>`).join("") || `<div class="empty-state" style="margin-top:14px;"><h4>Aucun tournoi</h4><p>Créez le premier : choisissez les écoles, les classes, la période et les défis.</p></div>`}`;
+  document.getElementById("tn-new").addEventListener("click", () => openTournoiModal(null));
+  root.querySelectorAll("[data-tn-res]").forEach(b => b.addEventListener("click", () => renderTournoiResultats(b.dataset.tnRes, "")));
+  root.querySelectorAll("[data-tn-edit]").forEach(b => b.addEventListener("click", () => openTournoiModal(liste.find(x => x.id === b.dataset.tnEdit))));
+  root.querySelectorAll("[data-tn-del]").forEach(b => b.addEventListener("click", async () => {
+    const t = liste.find(x => x.id === b.dataset.tnDel);
+    if (!confirm(`Supprimer le tournoi « ${t.nom} » ? Les défis et leurs résultats sont conservés ; seul le classement du tournoi disparaît.`)) return;
+    const { error: e } = await sb.rpc("admin_delete_tournoi", { p_token: tok(), p_id: t.id });
+    if (e) return NexiGamify.toast(e.message, "error");
+    renderTournois();
+  }));
+}
+
+function openTournoiModal(t) {
+  const maintenant = new Date(), debut = t ? tnVersLocal(t.date_debut) : tnVersLocal(maintenant), fin = t ? tnVersLocal(t.date_fin) : tnVersLocal(new Date(maintenant.getTime() + 7 * 86400000));
+  const selClasses = new Set(t && t.classes ? t.classes : []), selEcoles = new Set(t ? t.ecole_ids : []), selDefis = new Set(t ? t.defi_ids : []);
+  const modal = openModal(`<div style="max-height:78vh;overflow:auto;">
+    <h3>${t ? "Éditer" : "Nouveau"} tournoi</h3>
+    <div class="field"><label>Nom du tournoi</label><input id="tn-nom" maxlength="80" value="${t ? esc(t.nom) : ""}" placeholder="Ex. Tournoi de la rentrée"></div>
+    <div class="field"><label>Description (facultatif)</label><textarea id="tn-desc">${t ? esc(t.description || "") : ""}</textarea></div>
+    <div class="field"><label>Début</label><input id="tn-debut" type="datetime-local" value="${debut}"></div>
+    <div class="field"><label>Fin</label><input id="tn-fin" type="datetime-local" value="${fin}"></div>
+    <div class="field"><label>Nombre d'élèves comptés par école (top N)</label><input id="tn-top" type="number" min="1" max="100" value="${t ? t.top_n : 10}">
+      <small>Score d'une école = points de ses N meilleurs élèves ÷ N. Un élève absent compte 0.</small></div>
+    <div class="field"><label>Classes concernées (aucune cochée = toutes)</label>
+      <div id="tn-classes" style="display:flex;flex-wrap:wrap;gap:6px 12px;">${window.NEXI_CONFIG.CLASSES.map(c => `<label style="white-space:nowrap;"><input type="checkbox" value="${c.code}" ${selClasses.has(c.code) ? "checked" : ""}> ${c.code}</label>`).join("")}</div></div>
+    <div class="field"><label>Écoles inscrites</label>
+      <div id="tn-ecoles">${tnCache.ecoles.map(e => `<label style="display:block;"><input type="checkbox" value="${e.id}" ${selEcoles.has(e.id) ? "checked" : ""}> ${esc(e.nom)}</label>`).join("") || "<i>Créez d'abord des écoles (onglet Établissements).</i>"}</div></div>
+    <div class="field"><label>Défis du tournoi (un défi ne peut servir qu'à un seul tournoi)</label><div id="tn-defis"></div></div>
+    <div class="field"><label><input type="checkbox" id="tn-publie" ${t && t.publie ? "checked" : ""}> Visible par les élèves et les superviseurs</label></div>
+    <button class="btn block" id="tn-save">Enregistrer</button></div>`);
+  const classesCochees = () => [...modal.querySelectorAll("#tn-classes input:checked")].map(i => i.value);
+  const afficherDefis = () => {
+    const cl = classesCochees(), coches = new Set([...modal.querySelectorAll("#tn-defis input:checked")].map(i => i.value));
+    (selDefis.size && !modal.querySelector("#tn-defis input")) && selDefis.forEach(id => coches.add(id));
+    const dispo = tnCache.defis.filter(d => !cl.length || cl.includes(d.classe));
+    modal.querySelector("#tn-defis").innerHTML = dispo.map(d => {
+      const pris = d.tournoi_id && (!t || d.tournoi_id !== t.id);
+      return `<label style="display:block;${pris ? "opacity:.5;" : ""}"><input type="checkbox" value="${d.id}" ${coches.has(d.id) ? "checked" : ""} ${pris ? "disabled" : ""}> ${esc(d.titre)} <small>(${esc(d.classe || "—")}${d.publie ? "" : ", non publié"}${pris ? ", déjà dans un autre tournoi" : ""})</small></label>`;
+    }).join("") || "<i>Aucun défi pour ces classes. Créez-les d'abord dans l'onglet Défis.</i>";
+  };
+  afficherDefis();
+  modal.querySelector("#tn-classes").addEventListener("change", afficherDefis);
+  modal.querySelector("#tn-save").addEventListener("click", async () => {
+    const d = modal.querySelector("#tn-debut").value, f = modal.querySelector("#tn-fin").value;
+    if (!d || !f) return NexiGamify.toast("Indiquez les dates de début et de fin.", "error");
+    const { error } = await sb.rpc("admin_upsert_tournoi", {
+      p_token: tok(), p_id: t ? t.id : null, p_nom: modal.querySelector("#tn-nom").value, p_description: modal.querySelector("#tn-desc").value || null,
+      p_debut: new Date(d).toISOString(), p_fin: new Date(f).toISOString(), p_classes: classesCochees().length ? classesCochees() : null,
+      p_top_n: parseInt(modal.querySelector("#tn-top").value, 10) || 10, p_publie: modal.querySelector("#tn-publie").checked,
+      p_ecole_ids: [...modal.querySelectorAll("#tn-ecoles input:checked")].map(i => i.value),
+      p_defi_ids: [...modal.querySelectorAll("#tn-defis input:checked")].map(i => i.value)
+    });
+    if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+    modal.remove(); NexiGamify.toast("Tournoi enregistré.", "success"); renderTournois();
+  });
+}
+
+async function renderTournoiResultats(id, classe) {
+  const { data: r, error } = await sb.rpc("admin_tournoi_resultats", { p_token: tok(), p_id: id, p_classe: classe || null, p_limit: 30 });
+  if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+  const t = r.tournoi, MED = ["🥇", "🥈", "🥉"], classes = window.NEXI_CONFIG.CLASSES;
+  root.innerHTML = `
+    <button class="btn secondary" id="tn-back">← Tournois</button>
+    <h2 style="margin-top:10px;">🏆 ${esc(t.nom)}</h2>
+    <p>${TN_STATUT[t.publie ? t.statut : "brouillon"]} · ${tnQuand(t.date_debut)} → ${tnQuand(t.date_fin)} · top ${t.top_n}</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+      <label>Niveau :</label>
+      <select id="tn-classe"><option value="">Toutes les classes</option>${classes.map(c => `<option value="${c.code}" ${classe === c.code ? "selected" : ""}>${c.libelle}</option>`).join("")}</select>
+      <button class="btn secondary" id="tn-csv">⬇️ Exporter (CSV)</button></div>
+    <h3>Classement des écoles</h3>
+    <div class="table-wrap"><table><thead><tr><th>Rang</th><th>École</th><th>Score</th><th>Participation</th><th>Points cumulés</th></tr></thead><tbody>
+      ${r.classement_ecoles.map(x => `<tr><td>${MED[x.rang - 1] || x.rang}</td><td>${esc(x.ecole)}</td><td><b>${Number(x.score)}</b></td>
+        <td>${x.participants} / ${x.eligibles}${x.eligibles ? ` (${Math.round(100 * x.participants / x.eligibles)} %)` : ""}</td><td>${Number(x.points_total)}</td></tr>`).join("") || `<tr><td colspan="5">Aucune école inscrite.</td></tr>`}
+    </tbody></table></div>
+    <h3 style="margin-top:20px;">Meilleurs élèves (30 premiers)</h3>
+    <div class="table-wrap"><table><thead><tr><th>Rang</th><th>Pseudo</th><th>École</th><th>Classe</th><th>Défis</th><th>Points</th></tr></thead><tbody>
+      ${r.top_eleves.map(x => `<tr><td>${x.rang}</td><td>${esc(x.identifiant)}</td><td>${esc(x.ecole)}</td><td>${esc(x.classe || "")}</td><td>${x.defis}</td><td><b>${Number(x.points)}</b></td></tr>`).join("") || `<tr><td colspan="6">Aucun résultat pour l'instant.</td></tr>`}
+    </tbody></table></div>`;
+  document.getElementById("tn-back").addEventListener("click", renderTournois);
+  document.getElementById("tn-classe").addEventListener("change", e => renderTournoiResultats(id, e.target.value));
+  document.getElementById("tn-csv").addEventListener("click", async () => {
+    const { data: full, error: e2 } = await sb.rpc("admin_tournoi_resultats", { p_token: tok(), p_id: id, p_classe: document.getElementById("tn-classe").value || null, p_limit: 2000 });
+    if (e2) return NexiGamify.toast(e2.message, "error");
+    const c = v => `"${String(v ?? "").replace(/"/g, '""')}"`, L = [];
+    L.push(`Tournoi;${c(t.nom)}`, "", "Classement des écoles", "Rang;École;Score;Points cumulés;Ont joué;Éligibles");
+    full.classement_ecoles.forEach(x => L.push([x.rang, c(x.ecole), x.score, x.points_total, x.participants, x.eligibles].join(";")));
+    L.push("", "Classement des élèves", "Rang;Pseudo;École;Classe;Défis;Points");
+    full.top_eleves.forEach(x => L.push([x.rang, c(x.identifiant), c(x.ecole), c(x.classe), x.defis, x.points].join(";")));
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(["\uFEFF" + L.join("\n")], { type: "text/csv;charset=utf-8" }));
+    a.download = `tournoi-${t.nom.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.csv`; a.click();
+  });
+}
+
+// =========================================================
 // ÉTABLISSEMENTS
 // =========================================================
 async function renderEtablissements() {
@@ -1044,4 +1589,4 @@ async function renderReglages() {
 }
 
 // Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
-if (session && session.role === "admin") { injectNotifTab(); render("eleves"); }
+if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); render("eleves"); }

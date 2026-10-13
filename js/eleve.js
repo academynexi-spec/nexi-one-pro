@@ -28,7 +28,7 @@ function handleAuthError() {
   setTimeout(() => NexiAuth.logout(), 1500);
 }
 
-async function init() { bot = mountNexiBot(document.body); render("profil"); initNotifs(); }
+async function init() { bot = mountNexiBot(document.body); render("profil"); await initNotifs(); initTournois(); }
 
 async function render(view) {
   root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
@@ -38,6 +38,7 @@ async function render(view) {
   if (view === "cartes") return renderCartes();
   if (view === "classement") return renderClassement();
   if (view === "notifs") return renderNotifs();
+  if (view === "tournois") return renderTournois();
 }
 
 // ---------------------------------------------------------
@@ -78,6 +79,7 @@ async function renderProfil() {
   document.getElementById("avatar-input").addEventListener("change", async (e) => {
     const file = e.target.files[0]; if (!file) return;
     NexiGamify.toast("Envoi de la photo…");
+    const ancienneUrl = session.avatar_url;
     const url = await uploadAvatar(file, session.id);
     if (url) {
       const { error } = await sb.rpc("rpc_update_avatar", { p_eleve_id: session.id, p_token: session.token, p_url: url });
@@ -88,6 +90,7 @@ async function renderProfil() {
         return;
       }
       session.avatar_url = url; NexiAuth.setSession(session);
+      supprimerAncienAvatar(ancienneUrl, url, session.id);   // libère l'espace de l'ancienne photo
       document.getElementById("avatar-img").src = url;
       NexiGamify.toast("Photo mise à jour !", "success");
     }
@@ -584,6 +587,116 @@ async function renderNotifs() {
     const r = await sb.rpc("rpc_notifs_marquer_lues", { p_eleve_id: session.id, p_token: session.token });
     if (!r.error) setNotifsBadge(0, false);
   }
+}
+
+// ---------------------------------------------------------
+// TOURNOIS INTER-ÉCOLES — bouton 🏆 (uniquement si ton école est inscrite à un tournoi),
+// classements des écoles, ton rang, défis du tournoi. Silencieux sans le patch SQL.
+// ---------------------------------------------------------
+function ensureTournoiCss() {
+  if (document.getElementById("nexi-tn-css")) return;
+  const st = document.createElement("style");
+  st.id = "nexi-tn-css";
+  st.textContent = `
+    .tn-list{display:grid;gap:10px;margin-top:14px}
+    .tn-item{display:flex;flex-direction:column;gap:4px;width:100%;text-align:left;padding:14px;border-radius:16px;border:1px solid rgba(127,127,127,.35);
+      background:rgba(127,127,127,.12);color:inherit;font:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
+    .tn-item:hover{border-color:#FFC857}
+    .tn-item em{font-size:.78rem;opacity:.65;font-style:normal}
+    .tn-chip{display:inline-block;align-self:flex-start;padding:2px 10px;border-radius:999px;font-size:.75rem;font-weight:700;background:rgba(127,127,127,.25)}
+    .tn-chip.on{background:#37E29A;color:#06281a}
+    .tn-podium{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0;align-items:end}
+    .tn-pod{text-align:center;padding:10px 6px;border-radius:14px;border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.12)}
+    .tn-pod.moi,.tn-row.moi{border-color:#29F1E0;background:rgba(41,241,224,.12)}
+    .tn-pod .med{font-size:1.7rem}.tn-pod b{display:block;word-break:break-word}.tn-pod small{opacity:.75}
+    .tn-pod.p1{padding-top:18px}
+    .tn-row{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid rgba(127,127,127,.25);margin:6px 0}
+    .tn-row .rg{min-width:26px;font-weight:700;text-align:center}.tn-row .nm{flex:1;min-width:0;word-break:break-word}.tn-row .sc{font-weight:700}.tn-row small{opacity:.7;display:block}
+    .tn-card{padding:12px 14px;border-radius:14px;border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.12);margin:12px 0}`;
+  document.head.appendChild(st);
+}
+
+function dureeRestante(iso) {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return "";
+  const m = Math.floor(ms / 60000), j = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
+  return j > 0 ? `${j} j ${h} h` : h > 0 ? `${h} h ${m % 60} min` : `${Math.max(1, m)} min`;
+}
+function etiquetteTournoi(t) {
+  if (t.statut === "en_cours") return { cls: "on", txt: `En cours · reste ${dureeRestante(t.date_fin)}` };
+  if (t.statut === "a_venir") return { cls: "", txt: `Commence dans ${dureeRestante(t.date_debut)}` };
+  return { cls: "", txt: "Terminé" };
+}
+const dateCourteFr = (iso) => new Date(iso).toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+
+async function initTournois() {
+  const { data, error } = await sb.rpc("rpc_mes_tournois", { p_eleve_id: session.id, p_token: session.token });
+  if (error || !data || !data.length) return;           // patch absent ou aucun tournoi pour mon école : rien ne change
+  ensureTournoiCss();
+  const logout = document.getElementById("btn-logout"), ancre = notifsBell || logout;
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = (logout && logout.className) || "btn secondary";
+  btn.setAttribute("aria-label", "Tournois"); btn.textContent = "🏆";
+  btn.addEventListener("click", () => { setActiveNav(""); render("tournois"); });
+  if (ancre && ancre.parentNode) ancre.parentNode.insertBefore(btn, ancre);
+  else { btn.className = "btn secondary notif-fab"; btn.style.bottom = "140px"; document.body.appendChild(btn); }
+  const actif = data.find(t => t.statut === "en_cours");
+  if (actif) {
+    try { const k = "nexi_tn_" + actif.id; if (!localStorage.getItem(k)) { localStorage.setItem(k, "1"); NexiGamify.toast(`🏆 Tournoi en cours : ${actif.nom}`, "success"); } } catch (e) { /* ignoré */ }
+  }
+}
+
+async function renderTournois() {
+  ensureTournoiCss();
+  const { data, error } = await sb.rpc("rpc_mes_tournois", { p_eleve_id: session.id, p_token: session.token });
+  if (error) {
+    if (isAuthError(error)) return handleAuthError();
+    root.innerHTML = `<div class="empty-state"><h4>Erreur de chargement</h4><p>${escapeHtml(error.message || "")}</p></div>`; return;
+  }
+  const liste = data || [];
+  if (!liste.length) { root.innerHTML = `<div class="empty-state"><h4>Aucun tournoi pour le moment</h4><p>Quand ton école participera à un tournoi inter-écoles, il apparaîtra ici.</p></div>`; return; }
+  root.innerHTML = `<h2>🏆 Tournois</h2><div class="tn-list">${liste.map((t, i) => {
+    const e = etiquetteTournoi(t);
+    return `<button type="button" class="tn-item" data-i="${i}"><b>${escapeHtml(t.nom)}</b><span class="tn-chip ${e.cls}">${escapeHtml(e.txt)}</span>
+      ${t.description ? `<small>${escapeHtml(t.description)}</small>` : ""}<em>${dateCourteFr(t.date_debut)} → ${dateCourteFr(t.date_fin)} · ${t.nb_ecoles} école${t.nb_ecoles > 1 ? "s" : ""}</em></button>`;
+  }).join("")}</div>`;
+  root.querySelectorAll("[data-i]").forEach(el => el.addEventListener("click", () => renderTournoiDetail(liste[Number(el.dataset.i)].id)));
+}
+
+async function renderTournoiDetail(id) {
+  ensureTournoiCss();
+  root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
+  const { data: d, error } = await sb.rpc("rpc_tournoi_detail", { p_eleve_id: session.id, p_token: session.token, p_tournoi_id: id });
+  if (error) {
+    if (isAuthError(error)) return handleAuthError();
+    root.innerHTML = `<div class="empty-state"><h4>Tournoi introuvable</h4><p>${escapeHtml(error.message || "")}</p><button class="btn secondary" id="tn-back">← Tournois</button></div>`;
+    document.getElementById("tn-back").addEventListener("click", renderTournois); return;
+  }
+  const t = d.tournoi, e = etiquetteTournoi(t), MED = ["🥇", "🥈", "🥉"];
+  const ligne = (r, nomCle) => `<div class="tn-row${r.moi ? " moi" : ""}"><span class="rg">${MED[r.rang - 1] || r.rang}</span>
+      <span class="nm">${escapeHtml(r[nomCle])}${r.classe ? `<small>${escapeHtml(r.classe)}</small>` : ""}${r.participants != null ? `<small>${r.participants} / ${r.eligibles} élèves ont joué</small>` : ""}</span>
+      <span class="sc">${Number(r.score ?? r.points)}${r.score != null ? "" : " pts"}</span></div>`;
+  const podium = d.classement_ecoles.slice(0, 3);
+  const mon = d.classement_ecoles.find(r => r.moi);
+  const fini = t.statut === "termine";
+  root.innerHTML = `
+    <button class="btn secondary" id="tn-back" style="margin-bottom:8px;">← Tournois</button>
+    <h2>🏆 ${escapeHtml(t.nom)}</h2>
+    <span class="tn-chip ${e.cls}">${escapeHtml(e.txt)}</span>
+    ${t.description ? `<p style="color:var(--text-dim);">${escapeHtml(t.description)}</p>` : ""}
+    ${fini && mon ? `<div class="tn-card"><b>Résultat final : ton école est ${mon.rang === 1 ? "🥇 1ʳᵉ" : "n° " + mon.rang} sur ${d.classement_ecoles.length}.</b></div>` : ""}
+    <div class="tn-podium">${podium.map((r, i) => `<div class="tn-pod p${i + 1}${r.moi ? " moi" : ""}"><span class="med">${MED[i]}</span><b>${escapeHtml(r.ecole)}</b><small>${Number(r.score)} pts</small></div>`).join("")}</div>
+    <div class="tn-card">Tes points : <b>${Number(d.mes_points ?? 0)}</b>${d.mon_rang_ecole && Number(d.mes_points) > 0 ? ` · n° <b>${d.mon_rang_ecole}</b> dans ton école` : " · joue un défi du tournoi pour marquer des points !"}</div>
+    ${d.defis.length ? `<h3>Défis du tournoi</h3>${d.defis.map(x => `<div class="tn-row"><span class="nm"><b>${escapeHtml(x.titre)}</b></span>
+        ${x.fait ? `<span class="sc">✔ ${Math.round(Number(x.points))} pts</span>` : (t.statut === "en_cours" ? `<button class="btn" data-jouer="${x.id}">Jouer</button>` : `<span>—</span>`)}</div>`).join("")}` : ""}
+    <h3>Classement des écoles</h3>${d.classement_ecoles.map(r => ligne(r, "ecole")).join("")}
+    <h3>Dans ta classe (${escapeHtml(d.classe || "")})</h3>${d.classement_niveau.map(r => ligne(r, "ecole")).join("") || "<p>—</p>"}
+    ${d.top_eleves.length ? `<h3>Meilleurs élèves</h3>${d.top_eleves.map(r => ligne({ ...r, moi: r.moi, rang: r.rang }, "identifiant").replace(/<small>.*?<\/small>/, `<small>${escapeHtml(r.ecole)} · ${escapeHtml(r.classe)}</small>`)).join("")}` : ""}
+    <details style="margin-top:14px;"><summary style="cursor:pointer;">Comment est calculé le score d'une école ?</summary>
+      <p style="font-size:.88rem;">Le score d'une école est la somme des points de ses <b>${t.top_n} meilleurs élèves</b> divisée par ${t.top_n}. Un élève qui ne joue pas compte 0 : plus ton école compte d'élèves actifs, plus elle monte. Seuls comptent les défis du tournoi joués pendant sa période.</p></details>`;
+  document.getElementById("tn-back").addEventListener("click", renderTournois);
+  root.querySelectorAll("[data-jouer]").forEach(b => b.addEventListener("click", () => startQuiz(b.dataset.jouer)));
+  if (fini && mon && mon.rang === 1) { try { const k = "nexi_tn_win_" + t.id; if (!localStorage.getItem(k)) { localStorage.setItem(k, "1"); bot && bot.reactBravo(); } } catch (e) { /* ignoré */ } }
 }
 
 // ---------------------------------------------------------
