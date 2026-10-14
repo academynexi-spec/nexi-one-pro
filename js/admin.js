@@ -56,6 +56,7 @@ async function render(view) {
   if (view === "notifs") return renderNotifs();
   if (view === "stockage") return renderStockage();
   if (view === "tournois") return renderTournois();
+  if (view === "programmes") return renderProgrammes();
   if (view === "defis") return renderDefis();
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
@@ -147,6 +148,14 @@ function openEleveModal(e, ecoles) {
     <div class="field"><label><input type="checkbox" id="m-abo" ${!e || e.abonnement_actif ? "checked" : ""}> Abonnement actif</label></div>
     <button class="btn block" id="m-save">Enregistrer</button>
   `);
+  // École spéciale : seules les classes de son programme sont proposées (et inversement pour une école nationale).
+  const filtrerClasses = () => {
+    const sel = modal.querySelector("#m-classe"), sc = (ecoles || []).find(x => x.id === modal.querySelector("#m-ecole").value), prog = (sc && sc.programme_id) || null;
+    const courant = sel.value || (e && e.classe) || "";
+    sel.innerHTML = window.NEXI_CONFIG.CLASSES.filter(c => (c.programme_id || null) === prog).map(c => `<option value="${c.code}" ${courant === c.code ? "selected" : ""}>${c.libelle}</option>`).join("");
+  };
+  modal.querySelector("#m-ecole").addEventListener("change", filtrerClasses);
+  filtrerClasses();
   modal.querySelector("#m-save").addEventListener("click", async () => {
     const { error } = await sb.rpc("admin_upsert_eleve", {
       p_token: tok(), p_id: e ? e.id : null,
@@ -1402,6 +1411,185 @@ async function renderTournoiResultats(id, classe) {
 }
 
 // =========================================================
+// PROGRAMMES ET ÉCOLES SPÉCIALES (admin) — onglet « 🎓 Programmes »
+// Un programme a ses propres classes ; son contenu (défis, cartes, affinités, tournois) a la même
+// structure que le national mais reste séparé. Une école spéciale suit un programme.
+// =========================================================
+function injectProgrammesTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="programmes"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "programmes"; b.textContent = "🎓 Programmes";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("programmes");
+  });
+  tabs.appendChild(b);
+}
+const nomProgramme = id => (window.NexiProgrammes && NexiProgrammes.nom(id)) || null;
+const progBadge = ecole => ecole.programme_id ? `<span class="badge on">${esc(nomProgramme(ecole.programme_id) || "Spécial")}</span>` : "National";
+
+async function renderProgrammes() {
+  const { data: d, error } = await sb.rpc("admin_list_programmes", { p_token: tok() });
+  if (error) {
+    if (adminAuthFail(error)) return;
+    root.innerHTML = isMissingFn(error)
+      ? `<div class="empty-state"><h4>Programmes non activés</h4><p>Exécutez d'abord le patch SQL « programmes » dans Supabase.</p></div>`
+      : `<div class="empty-state"><h4>Erreur</h4><p>${esc(error.message || "")}</p></div>`;
+    return;
+  }
+  root.innerHTML = `
+    <h2>Programmes et écoles spéciales</h2>
+    <p style="font-size:.85rem;">Toutes les écoles suivent par défaut le <b>programme national</b>. Une <b>école spéciale</b> (bilingue, européenne…) suit son propre <b>programme</b> : ses propres classes et son propre contenu (défis, cartes de révision, affinités, tournois), avec exactement la même structure. Les contenus créés pour une classe du programme ne sont vus que par les élèves de cette classe.</p>
+    <p style="font-size:.85rem;">${d.classement_separe ? "✅ Le classement général compare uniquement des élèves du même programme." : "⚠️ Le classement général n'est pas séparé par programme (la fonction actuelle a une forme inattendue) : envoyez-moi ce message."}</p>
+    <div class="card">🇨🇩 <b>Programme national</b> · ${d.nb_ecoles_nationales} école(s)</div>
+    <button class="btn" id="pg-new" style="margin-top:12px;">＋ Nouveau programme</button>
+    ${d.programmes.map(p => `
+      <div class="card" style="margin-top:14px;">
+        <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><b>🎓 ${esc(p.nom)}</b><span><span class="badge on">${esc(p.code)}</span>${p.langue ? ` ${esc(p.langue)}` : ""}</span></div>
+        ${p.description ? `<p style="font-size:.85rem;margin:6px 0;">${esc(p.description)}</p>` : ""}
+        <div class="table-wrap"><table><thead><tr><th>Classe</th><th>Libellé</th><th>Élèves</th><th>Défis</th><th>Cartes</th></tr></thead><tbody>
+          ${p.niveaux.map(n => `<tr><td>${esc(n.code)}</td><td>${esc(n.libelle)}</td><td>${n.nb_eleves}</td><td>${n.nb_defis}</td><td>${n.nb_cartes}</td></tr>`).join("")}
+        </tbody></table></div>
+        <p style="font-size:.85rem;margin:8px 0;"><b>Écoles :</b> ${p.ecoles.map(e => `${esc(e.nom)} (${e.nb_eleves}/${e.limite_eleves})`).join(", ") || "aucune pour l'instant"} · <b>Affinités propres :</b> ${p.nb_affinites} question(s)</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn" data-pg-ecole="${p.id}">＋ École spéciale</button>
+          <button class="btn secondary" data-pg-copie="${p.id}">Reprendre du contenu</button>
+          <button class="btn secondary" data-pg-aff="${p.id}">Affinités</button>
+          <button class="btn secondary" data-pg-edit="${p.id}">Éditer</button>
+          <button class="btn ghost" data-pg-del="${p.id}" style="color:var(--coral);">Supprimer</button></div>
+      </div>`).join("")}`;
+  const trouver = id => d.programmes.find(x => x.id === id);
+  document.getElementById("pg-new").addEventListener("click", () => openProgrammeModal(null));
+  root.querySelectorAll("[data-pg-edit]").forEach(b => b.addEventListener("click", () => openProgrammeModal(trouver(b.dataset.pgEdit))));
+  root.querySelectorAll("[data-pg-ecole]").forEach(b => b.addEventListener("click", () => openEcoleSpecialeModal(trouver(b.dataset.pgEcole), renderProgrammes)));
+  root.querySelectorAll("[data-pg-copie]").forEach(b => b.addEventListener("click", () => openCopieModal(trouver(b.dataset.pgCopie))));
+  root.querySelectorAll("[data-pg-aff]").forEach(b => b.addEventListener("click", () => renderAffinitesProgramme(trouver(b.dataset.pgAff))));
+  root.querySelectorAll("[data-pg-del]").forEach(b => b.addEventListener("click", async () => {
+    const p = trouver(b.dataset.pgDel);
+    if (!confirm(`Supprimer le programme « ${p.nom} » ? (Possible seulement s'il n'a ni école, ni élève, ni contenu.)`)) return;
+    const { error: e } = await sb.rpc("admin_delete_programme", { p_token: tok(), p_id: p.id });
+    if (e) return NexiGamify.toast(e.message, "error");
+    if (window.NexiProgrammes) await NexiProgrammes.charger();
+    renderProgrammes();
+  }));
+}
+
+function openProgrammeModal(p) {
+  const modal = openModal(`<div style="max-height:78vh;overflow:auto;">
+    <h3>${p ? "Éditer" : "Nouveau"} programme</h3>
+    <div class="field"><label>Nom du programme</label><input id="pg-nom" maxlength="60" value="${p ? esc(p.nom) : ""}" placeholder="Ex. Programme bilingue"></div>
+    <div class="field"><label>Code (2 à 6 lettres ou chiffres — préfixe des classes, non modifiable ensuite)</label><input id="pg-code" maxlength="6" value="${p ? esc(p.code) : ""}" ${p ? "disabled" : ""} placeholder="Ex. BIL"></div>
+    <div class="field"><label>Langue d'enseignement (indicatif)</label><input id="pg-langue" value="${p ? esc(p.langue || "") : ""}" placeholder="Ex. fr/en"></div>
+    <div class="field"><label>Description (facultatif)</label><textarea id="pg-desc">${p ? esc(p.description || "") : ""}</textarea></div>
+    <div class="field"><label>Niveaux (classes) : une ligne par classe, « suffixe | libellé »</label>
+      <textarea id="pg-niv" style="min-height:130px;font-family:monospace;" placeholder="6e | 6ème&#10;5e | 5ème&#10;4e | 4ème">${p ? esc(p.niveaux.map(n => `${n.suffixe} | ${n.libelle}`).join("\n")) : ""}</textarea>
+      <small>Le code de chaque classe sera CODE-suffixe (ex. BIL-6e). Un niveau qui contient déjà des élèves ou du contenu ne peut plus être retiré.</small>
+      <button class="btn secondary" type="button" id="pg-nat" style="margin-top:6px;">Reprendre les niveaux nationaux</button></div>
+    <button class="btn block" id="pg-save">Enregistrer</button></div>`);
+  modal.querySelector("#pg-nat").addEventListener("click", () => {
+    modal.querySelector("#pg-niv").value = window.NEXI_CONFIG.CLASSES.filter(c => !c.programme_id).map(c => `${c.code} | ${c.libelle}`).join("\n");
+  });
+  modal.querySelector("#pg-save").addEventListener("click", async () => {
+    const niveaux = modal.querySelector("#pg-niv").value.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
+      const i = l.indexOf("|"); return i < 0 ? { suffixe: l, libelle: l } : { suffixe: l.slice(0, i).trim(), libelle: l.slice(i + 1).trim() };
+    });
+    const { error } = await sb.rpc("admin_upsert_programme", {
+      p_token: tok(), p_id: p ? p.id : null, p_nom: modal.querySelector("#pg-nom").value, p_code: p ? p.code : modal.querySelector("#pg-code").value,
+      p_description: modal.querySelector("#pg-desc").value || null, p_langue: modal.querySelector("#pg-langue").value || null, p_niveaux: niveaux
+    });
+    if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+    if (window.NexiProgrammes) await NexiProgrammes.charger();     // les nouvelles classes apparaissent aussitôt dans tous les formulaires
+    modal.remove(); NexiGamify.toast("Programme enregistré.", "success"); renderProgrammes();
+  });
+}
+
+// prog = programme imposé (onglet Programmes) ou null (bouton « + École spéciale » de l'onglet Écoles : on choisit)
+async function openEcoleSpecialeModal(prog, apres) {
+  let liste = prog ? [prog] : [];
+  if (!prog) {
+    const { data, error } = await sb.rpc("admin_list_programmes", { p_token: tok() });
+    if (error) return NexiGamify.toast(isMissingFn(error) ? "Activez d'abord le patch SQL « programmes »." : error.message, "error");
+    liste = data.programmes;
+    if (!liste.length) return NexiGamify.toast("Créez d'abord un programme (onglet 🎓 Programmes).", "error");
+  }
+  const modal = openModal(`
+    <h3>Nouvelle école spéciale</h3>
+    <div class="field"><label>Nom de l'établissement</label><input id="es-nom" maxlength="100"></div>
+    <div class="field"><label>Programme suivi</label><select id="es-prog">${liste.map(x => `<option value="${x.id}" ${prog && prog.id === x.id ? "selected" : ""}>${esc(x.nom)}</option>`).join("")}</select></div>
+    <div class="field"><label>Limite d'élèves</label><input id="es-lim" type="number" min="1" value="300"></div>
+    <p style="font-size:.8rem;">Les élèves de cette école ne pourront être placés que dans les classes du programme choisi.</p>
+    <button class="btn block" id="es-save">Créer l'école</button>`);
+  modal.querySelector("#es-save").addEventListener("click", async () => {
+    const { error } = await sb.rpc("admin_creer_ecole_speciale", { p_token: tok(), p_nom: modal.querySelector("#es-nom").value, p_limite: parseInt(modal.querySelector("#es-lim").value, 10) || 300, p_programme_id: modal.querySelector("#es-prog").value });
+    if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+    modal.remove(); NexiGamify.toast("École spéciale créée.", "success"); if (apres) apres();
+  });
+}
+
+function openCopieModal(p) {
+  const tout = window.NEXI_CONFIG.CLASSES, opt = (list, sel) => list.map(c => `<option value="${c.code}" ${sel === c.code ? "selected" : ""}>${esc(c.libelle)} (${esc(c.code)})</option>`).join("");
+  const modal = openModal(`
+    <h3>Reprendre du contenu dans « ${esc(p.nom)} »</h3>
+    <p style="font-size:.85rem;">Copie le contenu d'une classe vers une classe du programme, pour partir d'une base à adapter. Les défis copiés ne sont <b>jamais publiés</b> automatiquement ; les cartes sont masquées sauf si vous cochez l'option.</p>
+    <div class="field"><label>Depuis la classe</label><select id="cp-src">${opt(tout.filter(c => !c.programme_id), "")}${opt(tout.filter(c => c.programme_id), "")}</select></div>
+    <div class="field"><label>Vers la classe du programme</label><select id="cp-dst">${p.niveaux.map(n => `<option value="${esc(n.code)}">${esc(n.libelle)} (${esc(n.code)})</option>`).join("")}</select></div>
+    <div class="field"><label><input type="checkbox" id="cp-cartes" checked> Cartes de révision</label></div>
+    <div class="field"><label><input type="checkbox" id="cp-vis"> Rendre les cartes copiées visibles tout de suite</label></div>
+    <div class="field"><label><input type="checkbox" id="cp-defis" checked> Défis et leurs questions</label></div>
+    <button class="btn block" id="cp-go">Copier</button>`);
+  modal.querySelector("#cp-go").addEventListener("click", async () => {
+    const { data, error } = await sb.rpc("admin_copier_contenu", { p_token: tok(), p_source: modal.querySelector("#cp-src").value, p_cible: modal.querySelector("#cp-dst").value,
+      p_cartes: modal.querySelector("#cp-cartes").checked, p_defis: modal.querySelector("#cp-defis").checked, p_cartes_visibles: modal.querySelector("#cp-vis").checked });
+    if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+    modal.remove(); NexiGamify.toast(`${data.cartes} carte(s), ${data.defis} défi(s) (${data.questions} questions) copiés.`, "success"); renderProgrammes();
+  });
+}
+
+async function renderAffinitesProgramme(p) {
+  const { data: liste, error } = await sb.rpc("admin_list_affinites_prog", { p_token: tok(), p_programme_id: p.id });
+  if (error) { if (adminAuthFail(error)) return; return NexiGamify.toast(error.message, "error"); }
+  const L = window.NEXI_CONFIG.RIASEC_LABELS || {};
+  root.innerHTML = `
+    <button class="btn secondary" id="af-back">← Programmes</button>
+    <h2 style="margin-top:10px;">Affinités — ${esc(p.nom)}</h2>
+    <p style="font-size:.85rem;">Si ce programme a ses propres questions, ses élèves passent ce test à la place du test national (utile pour une autre langue). Sans question propre, ils passent le test national.</p>
+    <form id="af-form" class="card">
+      <div class="field"><label>Question</label><input id="af-texte" maxlength="300" required></div>
+      <div class="field"><label>Dimension</label><select id="af-dim">${["R", "I", "A", "S", "E", "C"].map(k => `<option value="${k}">${k} — ${esc(L[k] || k)}</option>`).join("")}</select></div>
+      <button class="btn" type="submit">Ajouter la question</button>
+      <button class="btn secondary" type="button" id="af-copie">Reprendre les questions nationales</button>
+    </form>
+    <div class="table-wrap"><table><thead><tr><th>Dim.</th><th>Question</th><th>Active</th><th></th></tr></thead><tbody>
+      ${liste.map(q => `<tr><td>${esc(q.dimension)}</td><td>${esc(q.texte)}</td><td>${q.actif ? "Oui" : "Non"}</td>
+        <td style="white-space:nowrap;"><button class="btn secondary" data-af-tog="${q.id}" style="padding:4px 10px;">${q.actif ? "Désactiver" : "Activer"}</button>
+        <button class="btn ghost" data-af-del="${q.id}" style="color:var(--coral);">Suppr.</button></td></tr>`).join("") || `<tr><td colspan="4">Aucune question propre : le test national est utilisé.</td></tr>`}
+    </tbody></table></div>`;
+  document.getElementById("af-back").addEventListener("click", renderProgrammes);
+  const refresh = () => renderAffinitesProgramme(p);
+  document.getElementById("af-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const { error: er } = await sb.rpc("admin_upsert_affinite_prog", { p_token: tok(), p_id: null, p_programme_id: p.id, p_texte: document.getElementById("af-texte").value, p_dimension: document.getElementById("af-dim").value, p_actif: true });
+    if (er) return NexiGamify.toast(er.message, "error"); refresh();
+  });
+  document.getElementById("af-copie").addEventListener("click", async () => {
+    const { data, error: er } = await sb.rpc("admin_copier_affinites_nationales", { p_token: tok(), p_programme_id: p.id });
+    if (er) return NexiGamify.toast(er.message, "error");
+    NexiGamify.toast(`${data} question(s) reprise(s) : traduisez/adaptez-les puis désactivez celles qui ne conviennent pas.`, "success"); refresh();
+  });
+  root.querySelectorAll("[data-af-tog]").forEach(b => b.addEventListener("click", async () => {
+    const q = liste.find(x => x.id === b.dataset.afTog);
+    const { error: er } = await sb.rpc("admin_upsert_affinite_prog", { p_token: tok(), p_id: q.id, p_programme_id: p.id, p_texte: q.texte, p_dimension: q.dimension, p_actif: !q.actif });
+    if (er) return NexiGamify.toast(er.message, "error"); refresh();
+  }));
+  root.querySelectorAll("[data-af-del]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("Supprimer cette question ?")) return;
+    const { error: er } = await sb.rpc("admin_delete_affinite_prog", { p_token: tok(), p_id: b.dataset.afDel });
+    if (er) return NexiGamify.toast(er.message, "error"); refresh();
+  }));
+}
+
+// =========================================================
 // ÉTABLISSEMENTS
 // =========================================================
 async function renderEtablissements() {
@@ -1409,10 +1597,10 @@ async function renderEtablissements() {
   const { data: sups } = await sb.rpc("admin_list_superviseurs", { p_token: tok() });
   const ecoleName = (id) => (ecoles || []).find(e => e.id === id)?.nom || "—";
   root.innerHTML = `
-    <div style="display:flex; justify-content:space-between; align-items:center;"><h2 style="margin:0;">Écoles</h2><button class="btn" id="btn-add-ecole">+ École</button></div>
+    <div style="display:flex; justify-content:space-between; align-items:center;"><h2 style="margin:0;">Écoles</h2><span style="display:flex;gap:8px;"><button class="btn" id="btn-add-ecole">+ École</button><button class="btn secondary" id="btn-add-ecole-speciale">+ École spéciale</button></span></div>
     <div class="table-wrap" style="margin-bottom:26px;"><table>
-      <thead><tr><th>Nom</th><th>Limite élèves</th><th></th></tr></thead>
-      <tbody>${(ecoles || []).map(e => `<tr><td>${esc(e.nom)}</td><td>${e.limite_eleves}</td><td><button class="btn secondary" data-edit-ecole="${e.id}" style="padding:5px 12px;">Éditer</button></td></tr>`).join("") || `<tr><td colspan="3">Aucune école.</td></tr>`}</tbody>
+      <thead><tr><th>Nom</th><th>Programme</th><th>Limite élèves</th><th></th></tr></thead>
+      <tbody>${(ecoles || []).map(e => `<tr><td>${esc(e.nom)}</td><td>${progBadge(e)}</td><td>${e.limite_eleves}</td><td><button class="btn secondary" data-edit-ecole="${e.id}" style="padding:5px 12px;">Éditer</button></td></tr>`).join("") || `<tr><td colspan="4">Aucune école.</td></tr>`}</tbody>
     </table></div>
 
     <div style="display:flex; justify-content:space-between; align-items:center;"><h2 style="margin:0;">Superviseurs</h2><button class="btn" id="btn-add-sup">+ Superviseur</button></div>
@@ -1422,6 +1610,7 @@ async function renderEtablissements() {
     </table></div>
   `;
   document.getElementById("btn-add-ecole").addEventListener("click", () => openEcoleModal(null));
+  document.getElementById("btn-add-ecole-speciale").addEventListener("click", () => openEcoleSpecialeModal(null, renderEtablissements));
   root.querySelectorAll("[data-edit-ecole]").forEach(b => b.addEventListener("click", () => openEcoleModal(ecoles.find(x => x.id === b.dataset.editEcole))));
   document.getElementById("btn-add-sup").addEventListener("click", () => openSupModal(null, ecoles));
   root.querySelectorAll("[data-edit-sup]").forEach(b => b.addEventListener("click", () => openSupModal(sups.find(x => x.id === b.dataset.editSup), ecoles)));
@@ -1589,4 +1778,6 @@ async function renderReglages() {
 }
 
 // Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
-if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); render("eleves"); }
+if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); injectProgrammesTab();
+  // Les classes des programmes spéciaux sont chargées AVANT le premier affichage (les formulaires les proposent aussitôt).
+  (window.NexiProgrammes ? NexiProgrammes.charger() : Promise.resolve()).catch(() => {}).then(() => render("eleves")); }

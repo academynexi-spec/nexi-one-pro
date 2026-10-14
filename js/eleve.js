@@ -259,6 +259,19 @@ async function startQuiz(defiId) {
 // ---------------------------------------------------------
 // AFFINITÉS (RIASEC)
 // ---------------------------------------------------------
+// Questions d'affinités : celles du programme de l'école si elle en a (école spéciale), sinon les questions nationales.
+async function questionsAffinites() {
+  try {
+    const { data: prog, error } = await sb.rpc("rpc_mon_programme", { p_eleve_id: session.id, p_token: session.token });
+    if (!error && prog && prog.length && prog[0].programme_id) {
+      const { data: propres, error: e2 } = await sb.from("affinites_questions_programme").select("*").eq("programme_id", prog[0].programme_id).eq("actif", true);
+      if (!e2 && propres && propres.length) return propres;
+    }
+  } catch (err) { /* repli sur les questions nationales */ }
+  const { data } = await sb.from("affinites_questions").select("*").eq("actif", true);
+  return data;
+}
+
 async function renderAffinites() {
   const { data: today, error: todayError } = await sb.rpc("rpc_affinite_today", { p_eleve_id: session.id, p_token: session.token });
   if (todayError) {
@@ -277,7 +290,7 @@ async function renderAffinites() {
       </div>`;
     return;
   }
-  const { data: questions } = await sb.from("affinites_questions").select("*").eq("actif", true);
+  const questions = await questionsAffinites();
   if (!questions || !questions.length) {
     root.innerHTML = `<div class="empty-state"><h4>Pas encore de questions</h4><p>L'admin n'a pas encore ajouté de questions d'affinités.</p></div>`;
     return;

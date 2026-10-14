@@ -167,4 +167,5 @@ async function renderTournoiDetail(id) {
 }
 
 injectTournoiTab();
-render("eleves");
+// Superviseur d'une école spéciale : seules les classes de son programme sont proposées (sans effet pour une école nationale).
+(window.NexiProgrammes ? NexiProgrammes.charger({ ecoleId: session.ecole_id, restreindre: true }) : Promise.resolve()).catch(() => {}).then(() => render("eleves"));
