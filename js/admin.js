@@ -57,6 +57,7 @@ async function render(view) {
   if (view === "stockage") return renderStockage();
   if (view === "tournois") return renderTournois();
   if (view === "programmes") return renderProgrammes();
+  if (view === "abonnements") return renderAbonnements();
   if (view === "defis") return renderDefis();
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
@@ -81,6 +82,8 @@ async function renderEleves() {
   const { data: ecoles } = await sb.rpc("admin_list_ecoles", { p_token: tok() });
   const ecoleName = (id) => (ecoles || []).find(e => e.id === id)?.nom || "Domicile";
   const { data: pendingCount } = await sb.rpc("admin_count_eleves", { p_token: tok(), p_valide: false });
+  const aboMap = {};   // états d'abonnement calculés (dates) ; vide si le patch SQL « abonnements » n'est pas appliqué
+  try { const { data: st } = await sb.rpc("admin_abonnements_etat", { p_token: tok(), p_ids: (eleves || []).map(x => x.id) }); (st || []).forEach(x => { aboMap[x.id] = x; }); } catch (err) { /* ignoré */ }
   const totalPages = Math.max(1, Math.ceil((total || 0) / pageSize));
 
   root.innerHTML = `
@@ -101,7 +104,7 @@ async function renderEleves() {
           <tr>
             <td>${!e.valide ? `<span class="badge pending">En attente</span>` : e.actif ? `<span class="badge on">Actif</span>` : `<span class="badge off">Suspendu</span>`}</td>
             <td>${esc(e.nom_complet)}</td><td>${esc(e.identifiant)}</td><td>${esc(e.classe || "—")}</td><td>${esc(ecoleName(e.ecole_id))}</td>
-            <td>${e.abonnement_actif ? `<span class="badge on">Actif</span>` : `<span class="badge off">Expiré</span>`}</td>
+            <td>${badgeAbo(e, aboMap)}</td>
             <td style="white-space:nowrap;">
               ${!e.valide ? `<button class="btn secondary" data-valider="${e.id}" style="padding:6px 12px;">Valider</button>` : ""}
               <button class="btn secondary" data-edit="${e.id}" style="padding:6px 12px;">Éditer</button>
@@ -146,7 +149,16 @@ function openEleveModal(e, ecoles) {
     <div class="field"><label>École (vide = domicile)</label><select id="m-ecole"><option value="">— Domicile —</option>${(ecoles || []).map(sc => `<option value="${sc.id}" ${e?.ecole_id === sc.id ? "selected" : ""}>${esc(sc.nom)}</option>`).join("")}</select></div>
     <div class="field"><label><input type="checkbox" id="m-actif" ${!e || e.actif ? "checked" : ""}> Compte actif</label></div>
     <div class="field"><label><input type="checkbox" id="m-abo" ${!e || e.abonnement_actif ? "checked" : ""}> Abonnement actif</label></div>
+    <div id="m-abo-dates">
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <div class="field" style="flex:1; min-width:140px;"><label>Début d'abonnement</label><input type="date" id="m-abo-debut"></div>
+        <div class="field" style="flex:1; min-width:140px;"><label>Fin d'abonnement</label><input type="date" id="m-abo-fin"></div>
+      </div>
+      <p style="font-size:.82rem; margin:-4px 0 12px;">Laisser vide = sans limite de date. L'état (actif, expiré, à venir) est calculé automatiquement ; la date de fin est incluse.</p>
+    </div>
     <button class="btn block" id="m-save">Enregistrer</button>
+    ${e ? `<button class="btn secondary block" id="m-liberer" type="button" style="margin-top:8px;">Libérer la session (déconnecter l'élève)</button>
+    <p style="font-size:.8rem; margin:6px 0 0;">À utiliser si l'élève a perdu ou changé de téléphone : son compte est libéré immédiatement et il devra se reconnecter.</p>` : ""}
   `);
   // École spéciale : seules les classes de son programme sont proposées (et inversement pour une école nationale).
   const filtrerClasses = () => {
@@ -156,8 +168,22 @@ function openEleveModal(e, ecoles) {
   };
   modal.querySelector("#m-ecole").addEventListener("change", filtrerClasses);
   filtrerClasses();
+  // Dates d'abonnement : chargées à l'ouverture (la liste ne les contient pas). Champs masqués si le patch SQL n'est pas appliqué.
+  (async () => {
+    const d = modal.querySelector("#m-abo-debut"), f = modal.querySelector("#m-abo-fin");
+    const lib = modal.querySelector("#m-liberer");
+    if (lib) lib.addEventListener("click", async () => {
+      if (!confirm(`Libérer le compte de ${e.nom_complet} ?\nIl sera déconnecté de son appareil et devra se reconnecter.`)) return;
+      const { error } = await sb.rpc("admin_liberer_session", { p_token: tok(), p_eleve_id: e.id });
+      NexiGamify.toast(error ? "Erreur : " + error.message : "Compte libéré : l'élève devra se reconnecter.", error ? "error" : "success");
+    });
+    if (e) d.disabled = f.disabled = true;
+    const { data, error } = await sb.rpc("admin_abonnements_etat", { p_token: tok(), p_ids: e ? [e.id] : [] });
+    if (error || (e && !(data && data[0]))) { modal._aboOff = true; modal.querySelector("#m-abo-dates").style.display = "none"; return; }
+    if (e) { modal._aboInit = { debut: data[0].debut || null, fin: data[0].fin || null }; d.value = data[0].debut || ""; f.value = data[0].fin || ""; d.disabled = f.disabled = false; }
+  })();
   modal.querySelector("#m-save").addEventListener("click", async () => {
-    const { error } = await sb.rpc("admin_upsert_eleve", {
+    const { data: saved, error } = await sb.rpc("admin_upsert_eleve", {
       p_token: tok(), p_id: e ? e.id : null,
       p_nom_complet: modal.querySelector("#m-nom").value, p_identifiant: modal.querySelector("#m-id").value,
       p_password: modal.querySelector("#m-pw").value, p_sexe: modal.querySelector("#m-sexe").value,
@@ -165,7 +191,8 @@ function openEleveModal(e, ecoles) {
       p_actif: modal.querySelector("#m-actif").checked, p_abonnement_actif: modal.querySelector("#m-abo").checked
     });
     if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
-    modal.remove(); NexiGamify.toast("Enregistré.", "success"); renderEleves();
+    const avis = await enregistrerDatesAbo(modal, e, saved);
+    modal.remove(); NexiGamify.toast(avis || "Enregistré.", avis ? "error" : "success"); renderEleves();
   });
 }
 
@@ -809,34 +836,51 @@ async function renderNotifs() {
   }
   const ICONES = { defi: "🎯", cartes: "🗂️", message: "📢" };
   const quand = (iso) => new Date(iso).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+  const push = await pushEtat(true);
+  const envoyeLe = new Map(((push && push.etat && push.etat.recentes) || []).map(x => [x.id, x.push_envoye_at]));
+  const pushManuel = !!(push && !push.absent && !push.etat.auto_actif);
+  const cellulePush = (n) => envoyeLe.get(n.id) ? `<small>📲 envoyé</small>` : pushManuel ? `<button class="btn secondary" data-npush="${n.id}" style="padding:4px 10px;">📲 Envoyer</button>` : "—";
   root.innerHTML = `
     <h2>Notifications</h2>
+    ${carteAlertesPush(push)}
     <p style="font-size:.82rem;">Les élèves voient une pastille 🔔 dans l'app. Un message « Nouveau défi » part automatiquement quand vous publiez un défi ; pour les cartes, utilisez le bouton « Notifier » après un import.</p>
     <form id="form-n" class="card">
       <div class="field"><label>Destinataires</label><select id="n-classe"><option value="">Tous les élèves</option>${window.NEXI_CONFIG.CLASSES.map(c => `<option value="${c.code}">${c.libelle}</option>`).join("")}</select></div>
       <div class="field"><label>Type</label><select id="n-type"><option value="message">📢 Message</option><option value="cartes">🗂️ Nouvelles cartes</option><option value="defi">🎯 Défi</option></select></div>
       <div class="field"><label>Titre (80 caractères max)</label><input id="n-titre" maxlength="80" required></div>
       <div class="field"><label>Message (facultatif, 300 caractères max)</label><textarea id="n-corps" maxlength="300"></textarea></div>
+      ${pushManuel ? `<label style="display:block;margin:8px 0;"><input type="checkbox" id="n-push" checked> 📲 Envoyer aussi sur les téléphones (même appli fermée)</label>` : ""}
       <button class="btn block" type="submit">Envoyer</button>
     </form>
     <h3 style="margin-top:26px;">Historique</h3>
     <div class="table-wrap"><table>
-      <thead><tr><th>Date</th><th>Pour</th><th>Notification</th><th>Vu par</th><th></th></tr></thead>
+      <thead><tr><th>Date</th><th>Pour</th><th>Notification</th><th>Vu par</th><th>Téléphones</th><th></th></tr></thead>
       <tbody>${(liste || []).map(n => `
         <tr><td>${quand(n.created_at)}</td><td>${n.classe ? esc(n.classe) : "Tous"}</td>
         <td>${ICONES[n.type] || "🔔"} <b>${esc(n.titre)}</b>${n.corps ? `<br><small>${esc(n.corps)}</small>` : ""}</td>
-        <td>${n.nb_vues} / ${n.nb_destinataires}</td>
-        <td><button class="btn ghost" data-ndel="${n.id}" style="color:var(--coral);">Suppr.</button></td></tr>`).join("") || `<tr><td colspan="5">Aucune notification envoyée.</td></tr>`}
+        <td>${n.nb_vues} / ${n.nb_destinataires}</td><td>${cellulePush(n)}</td>
+        <td><button class="btn ghost" data-ndel="${n.id}" style="color:var(--coral);">Suppr.</button></td></tr>`).join("") || `<tr><td colspan="6">Aucune notification envoyée.</td></tr>`}
       </tbody>
     </table></div>`;
   document.getElementById("form-n").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const { error: err } = await sb.rpc("admin_envoyer_notification", {
+    const { data: nid, error: err } = await sb.rpc("admin_envoyer_notification", {
       p_token: tok(), p_classe: document.getElementById("n-classe").value || null, p_titre: document.getElementById("n-titre").value,
       p_corps: document.getElementById("n-corps").value || null, p_type: document.getElementById("n-type").value
     });
     if (err) { if (adminAuthFail(err)) return; return NexiGamify.toast(err.message, "error"); }
-    NexiGamify.toast("Notification envoyée.", "success"); renderNotifs();
+    NexiGamify.toast("Notification envoyée.", "success");
+    const casePush = document.getElementById("n-push");
+    if (casePush && casePush.checked) await pousserNotification(nid);
+    renderNotifs();
+  });
+  root.querySelectorAll("[data-npush]").forEach(b => b.addEventListener("click", async () => { b.disabled = true; await pousserNotification(b.dataset.npush); renderNotifs(); }));
+  const bAuto = document.getElementById("push-auto");
+  if (bAuto) bAuto.addEventListener("click", async () => {
+    const { error: e2 } = await sb.rpc("admin_push_auto_set", { p_token: tok(), p_url: location.origin + "/api/push", p_actif: !push.etat.auto_actif });
+    if (e2) return NexiGamify.toast(e2.message, "error");
+    NexiGamify.toast(push.etat.auto_actif ? "Envoi automatique désactivé." : "Envoi automatique activé : chaque notification part sur les téléphones.", "success");
+    renderNotifs();
   });
   root.querySelectorAll("[data-ndel]").forEach(b => b.addEventListener("click", async () => {
     if (!confirm("Supprimer cette notification ? Elle disparaîtra aussi chez les élèves.")) return;
@@ -846,6 +890,44 @@ async function renderNotifs() {
   }));
 }
 
+// =========================================================
+// ALERTES PUSH (admin) — envoi aux téléphones, état du serveur d'envoi, mode automatique
+// =========================================================
+let pushCache = null;    // { absent } | { etat, serveur }
+
+async function pushEtat(force) {
+  if (pushCache && !force) return pushCache;
+  const { data: etat, error } = await sb.rpc("admin_push_etat", { p_token: tok() });
+  if (error) { if (adminAuthFail(error)) return null; pushCache = { absent: true }; return pushCache; }
+  let serveur = null;
+  try { const r = await fetch("/api/push", { cache: "no-store" }); serveur = await r.json(); } catch (e) { serveur = null; }   // null = fichier api/push.js non déployé
+  pushCache = { etat, serveur };
+  return pushCache;
+}
+
+// Envoie une notification déjà enregistrée aux téléphones abonnés. Sans effet si le push n'est pas en place ou est déjà automatique.
+async function pousserNotification(id) {
+  const p = await pushEtat(false);
+  if (!p || p.absent || p.etat.auto_actif) return null;
+  if (!p.serveur || !p.serveur.ok) { NexiGamify.toast(p.serveur ? "Alertes téléphone : variables manquantes sur Vercel (voir le guide)." : "Alertes téléphone : fichier api/push.js non déployé (voir le guide).", "error"); return null; }
+  try {
+    const r = await fetch("/api/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ notification_id: id, admin_token: tok() }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { NexiGamify.toast(`Push : ${j.error || "échec"}`, "error"); return null; }
+    NexiGamify.toast(`📲 Push : ${j.envoyes} envoyé(s)${j.echecs ? `, ${j.echecs} échec(s)` : ""}${j.expires ? `, ${j.expires} abonnement(s) périmé(s) retiré(s)` : ""}${j.restants ? `, ${j.restants} restant(s) non envoyé(s) (réessayez)` : ""}.`, j.echecs || j.restants ? "error" : "success");
+    return j;
+  } catch (e) { NexiGamify.toast("Push : serveur injoignable.", "error"); return null; }
+}
+
+function carteAlertesPush(p) {
+  if (!p || p.absent) return `<div class="card" style="font-size:.85rem;">📲 <b>Alertes sur téléphone</b> : non activées. Exécutez le patch SQL « push » (voir le guide) pour envoyer les notifications aux téléphones, même appli fermée.</div>`;
+  const e = p.etat, ok = p.serveur && p.serveur.ok;
+  const serveur = ok ? "✅ prêt" : p.serveur ? "❌ variables manquantes sur Vercel" : "❌ fichier api/push.js non déployé";
+  const auto = e.auto_actif ? "✅ actif : chaque notification part automatiquement" : e.pg_net ? "inactif" : "indisponible (activez l'extension pg_net : Supabase › Database › Extensions)";
+  return `<div class="card" style="font-size:.88rem;">📲 <b>Alertes sur téléphone</b><br>${e.appareils} appareil(s) abonné(s) · ${e.eleves} élève(s)<br>Serveur d'envoi : ${serveur}<br>Envoi automatique : ${auto}
+    ${e.pg_net || e.auto_actif ? `<br><button class="btn secondary" id="push-auto" style="margin-top:6px;">${e.auto_actif ? "Désactiver l'envoi automatique" : "Activer l'envoi automatique"}</button>` : ""}</div>`;
+}
+
 // Bouton « Notifier » après un import de cartes : une notification par classe concernée
 async function impNotifier() {
   if (!impDernier) return;
@@ -853,7 +935,7 @@ async function impNotifier() {
   for (const x of impDernier.pairs.values()) (parClasse[x.classe] = parClasse[x.classe] || []).push(x.cours);
   let envoyees = 0;
   for (const [classe, cours] of Object.entries(parClasse)) {
-    const { error } = await sb.rpc("admin_envoyer_notification", {
+    const { data: nid, error } = await sb.rpc("admin_envoyer_notification", {
       p_token: tok(), p_classe: classe, p_titre: "Nouvelles cartes de révision",
       p_corps: ("À réviser : " + [...new Set(cours)].join(", ")).slice(0, 300), p_type: "cartes"
     });
@@ -862,6 +944,7 @@ async function impNotifier() {
       return NexiGamify.toast(isMissingFn(error) ? "Activez d'abord le patch SQL des notifications." : error.message, "error");
     }
     envoyees++;
+    await pousserNotification(nid);      // sans effet si le push n'est pas en place ou s'il est automatique
   }
   document.getElementById("imp-notif").style.display = "none";
   NexiGamify.toast(`${envoyees} classe(s) notifiée(s).`, "success");
@@ -1699,7 +1782,7 @@ async function runDiagnostic() {
   });
   await test("Lecture publique — categories", async () => (await sb.from("categories").select("id").limit(1)));
   await test("Lecture publique — défis publiés", async () => (await sb.from("defis").select("id").eq("publie", true).limit(1)));
-  await test("Lecture publique — cartes visibles", async () => (await sb.from("cartes_revision").select("id").eq("masque", false).limit(1)));
+  await test("RPC admin — admin_diag_cartes (cartes visibles)", async () => (await sb.rpc("admin_diag_cartes", { p_token: tok(), p_classes: null })));
   await test("Lecture publique — affinités actives", async () => (await sb.from("affinites_questions").select("id").eq("actif", true).limit(1)));
 
   await test("RPC admin — admin_list_ecoles", async () => (await sb.rpc("admin_list_ecoles", { p_token: tok() })));
@@ -1725,11 +1808,8 @@ async function runDiagnostic() {
   if (eleves && defis) {
     const classesAvecEleves = [...new Set(eleves.filter(e => e.valide).map(e => e.classe))];
     const classesAvecDefiPublie = new Set(defis.filter(d => d.publie).map(d => d.classe));
-    const comptes = await Promise.all(classesAvecEleves.map(async classe => {
-      const r = await sb.from("cartes_revision").select("id", { count: "exact", head: true }).eq("classe", classe).eq("masque", false);
-      return [classe, (r.count || 0) > 0];
-    }));
-    const classesAvecCarteVisible = new Set(comptes.filter(([, ok]) => ok).map(([c]) => c));
+    const { data: nbCartes } = await sb.rpc("admin_diag_cartes", { p_token: tok(), p_classes: classesAvecEleves });
+    const classesAvecCarteVisible = new Set((nbCartes || []).filter(x => Number(x.nb) > 0).map(x => x.classe));
     classesAvecEleves.forEach(classe => {
       const hasDefi = classesAvecDefiPublie.has(classe);
       const hasCarte = classesAvecCarteVisible.has(classe);
@@ -1777,7 +1857,222 @@ async function renderReglages() {
   });
 }
 
+// =========================================================
+// ABONNEMENTS (admin) — dates de début / fin, état calculé, renouvellement en masse, blocage général.
+// Onglet ajouté par le script (aucune modification de admin.html).
+// =========================================================
+const aboState = { page: 0, pageSize: 25, search: "", classe: "", ecole: "", etat: "" };
+const aboSel = new Set();
+const ABO_LIB = { actif: ["on", "Actif"], a_venir: ["pending", "À venir"], expire: ["off", "Expiré"], inactif: ["off", "Inactif"] };
+const aboDate = (iso) => iso ? new Date(iso + "T00:00:00").toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" }) : "—";
+const aboAbsent = (error) => !!error && (error.code === "PGRST202" || /could not find the function|schema cache/i.test(error.message || ""));
+
+function badgeAbo(e, map) {
+  const st = map && map[e.id];
+  if (!st) return e.abonnement_actif ? `<span class="badge on">Actif</span>` : `<span class="badge off">Expiré</span>`;
+  const [cls, lib] = ABO_LIB[st.etat] || ["off", st.etat];
+  const note = st.etat === "a_venir" ? `<br><small>dès le ${aboDate(st.debut)}</small>`
+    : st.fin ? `<br><small>${st.etat === "expire" ? "fini le " : "jusqu'au "}${aboDate(st.fin)}</small>`
+    : st.etat === "actif" ? `<br><small>sans date de fin</small>` : "";
+  return `<span class="badge ${cls}">${lib}</span>${note}`;
+}
+
+// Enregistre les dates saisies dans la fiche d'un élève (uniquement si elles ont changé).
+async function enregistrerDatesAbo(modal, e, saved) {
+  if (modal._aboOff) return null;
+  const debut = modal.querySelector("#m-abo-debut").value || null, fin = modal.querySelector("#m-abo-fin").value || null;
+  const init = modal._aboInit;
+  if (e && init && init.debut === debut && init.fin === fin) return null;
+  if (!e && !debut && !fin) return null;
+  const id = e ? e.id : (typeof saved === "string" ? saved : null);
+  if (!id) return "Élève créé. Saisissez ses dates d'abonnement dans l'onglet Abonnements.";
+  const { error } = await sb.rpc("admin_set_abonnement", { p_token: tok(), p_eleve_ids: [id], p_debut: debut, p_fin: fin, p_actif: modal.querySelector("#m-abo").checked });
+  return error ? "Élève enregistré, mais dates d'abonnement refusées : " + error.message : null;
+}
+
+function injectAbonnementsTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="abonnements"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "abonnements"; b.textContent = "💳 Abonnements";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("abonnements");
+  });
+  tabs.appendChild(b);
+}
+
+async function renderAbonnements() {
+  const s = aboState;
+  const filtres = () => ({ p_token: tok(), p_search: s.search || null, p_classe: s.classe || null, p_ecole_id: s.ecole || null, p_etat: s.etat || null });
+  const [lst, res, eco, secu] = await Promise.all([
+    sb.rpc("admin_list_abonnements", { ...filtres(), p_limit: s.pageSize, p_offset: s.page * s.pageSize }),
+    sb.rpc("admin_abonnements_resume", { p_token: tok() }),
+    sb.rpc("admin_list_ecoles", { p_token: tok() }),
+    sb.rpc("admin_get_securite", { p_token: tok() })
+  ]);
+  const sec = secu.error ? null : (secu.data || {});   // null = patch « sécurité » non appliqué : la carte n'apparaît pas
+  if (lst.error) {
+    const absent = aboAbsent(lst.error);
+    root.innerHTML = `<div class="empty-state"><h4>${absent ? "Abonnements non activés" : "Erreur d'accès"}</h4><p>${esc(absent ? "Exécutez d'abord le patch SQL « abonnements » dans Supabase." : lst.error.message || "")}</p></div>`;
+    return;
+  }
+  const rows = lst.data || [], total = rows.length ? Number(rows[0].total) : 0, r = res.data || {}, ecoles = eco.data || [];
+  const pages = Math.max(1, Math.ceil(total / s.pageSize));
+  const ecoleNom = (id) => ecoles.find(x => x.id === id)?.nom || "Domicile";
+  const chip = (k, lib, n) => `<button class="btn ${s.etat === k ? "" : "secondary"}" data-chip="${k}" style="padding:6px 12px;">${lib} (${n || 0})</button>`;
+
+  root.innerHTML = `
+    <h2 style="margin:0 0 12px;">Abonnements</h2>
+    ${sec ? `<div class="card" style="margin-bottom:16px; border-color:${sec.session_unique ? "var(--cyan)" : "var(--gold)"};">
+      <b>Un seul appareil à la fois : ${sec.session_unique ? "✅ ACTIVÉ" : "⏸ DÉSACTIVÉ"}</b>
+      <p style="margin:6px 0 10px; font-size:.9rem;">${sec.session_unique
+        ? "Un élève ne peut pas être connecté sur deux appareils en même temps : si un ami utilise ses identifiants pendant qu'il est actif, la connexion est refusée (« Compte déjà utilisé »)."
+        : "Désactivé : un compte peut être ouvert sur plusieurs appareils à la fois."}</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button class="btn ${sec.session_unique ? "secondary" : ""}" id="sec-toggle">${sec.session_unique ? "Désactiver" : "Activer"}</button>
+        <label style="font-size:.9rem;">Libéré après
+          <select id="sec-fenetre">${[1, 2, 3, 5, 10, 15, 30].map(m => `<option value="${m}" ${Number(sec.fenetre_minutes) === m ? "selected" : ""}>${m} min</option>`).join("")}</select>
+          sans activité</label>
+      </div>
+    </div>` : ""}
+    <div class="card" style="margin-bottom:16px; border-color:${r.blocage ? "var(--cyan)" : "var(--gold)"};">
+      <b>Blocage des comptes sans abonnement actif : ${r.blocage ? "✅ ACTIVÉ" : "⏸ DÉSACTIVÉ"}</b>
+      <p style="margin:6px 0 10px; font-size:.9rem;">${r.blocage
+        ? "Un élève dont l'abonnement est expiré, pas encore commencé ou inactif ne peut ouvrir que son profil."
+        : "Mode préparation : les élèves ne voient aucun changement. Saisissez les dates, vérifiez la liste, puis activez le blocage."}</p>
+      <button class="btn ${r.blocage ? "secondary" : ""}" id="ab-blocage">${r.blocage ? "Désactiver le blocage" : "Activer le blocage"}</button>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+      ${chip("", "Tous", r.total)}${chip("actif", "Actifs", r.actif)}${chip("bientot", "Fin ≤ 7 jours", r.bientot)}${chip("expire", "Expirés", r.expire)}${chip("a_venir", "À venir", r.a_venir)}${chip("inactif", "Inactifs", r.inactif)}
+    </div>
+    <div class="filters-row">
+      <input id="ab-search" placeholder="Rechercher (nom ou identifiant)" value="${esc(s.search)}">
+      <select id="ab-classe"><option value="">Toutes les classes</option>${window.NEXI_CONFIG.CLASSES.map(c => `<option value="${c.code}" ${s.classe === c.code ? "selected" : ""}>${c.libelle}</option>`).join("")}</select>
+      <select id="ab-ecole"><option value="">Toutes les écoles</option>${ecoles.map(x => `<option value="${x.id}" ${s.ecole === x.id ? "selected" : ""}>${esc(x.nom)}</option>`).join("")}</select>
+      <button class="btn secondary" id="ab-filtrer">Filtrer</button>
+    </div>
+    <div class="card" style="margin:12px 0;">
+      <b id="ab-count">0 élève sélectionné</b>
+      <label style="margin-left:12px; font-size:.9rem;"><input type="checkbox" id="ab-all"> Les ${total} résultat(s) du filtre (toutes les pages)</label>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; margin-top:10px;">
+        <div class="field" style="margin:0;"><label>Début</label><input type="date" id="ab-d"></div>
+        <div class="field" style="margin:0;"><label>Fin</label><input type="date" id="ab-f"></div>
+        <button class="btn" id="ab-dates">Appliquer ces dates</button>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px;">
+        <span style="font-size:.9rem;">Renouveler :</span>
+        ${[1, 3, 6, 12].map(m => `<button class="btn secondary" data-mois="${m}" style="padding:6px 12px;">+${m} mois</button>`).join("")}
+      </div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th><input type="checkbox" id="ab-page" aria-label="Tout sélectionner sur cette page"></th><th>Nom</th><th>Identifiant</th><th>Classe</th><th>École</th><th>Début</th><th>Fin</th><th>État</th><th></th></tr></thead>
+      <tbody>${rows.map(x => `<tr>
+        <td><input type="checkbox" data-sel="${x.id}" ${aboSel.has(x.id) ? "checked" : ""}></td>
+        <td>${esc(x.nom_complet)}</td><td>${esc(x.identifiant)}</td><td>${esc(x.classe || "—")}</td><td>${esc(ecoleNom(x.ecole_id))}</td>
+        <td>${aboDate(x.debut)}</td><td>${aboDate(x.fin)}</td><td>${badgeAbo({ id: x.id }, { [x.id]: x })}</td>
+        <td><button class="btn secondary" data-edit="${x.id}" style="padding:6px 12px;">Modifier</button></td></tr>`).join("") || `<tr><td colspan="9">Aucun résultat.</td></tr>`}</tbody>
+    </table></div>
+    <div class="pager">
+      <button class="btn ghost" id="ab-prev" ${s.page === 0 ? "disabled" : ""}>‹ Précédent</button>
+      Page ${s.page + 1} / ${pages}
+      <button class="btn ghost" id="ab-next" ${s.page >= pages - 1 ? "disabled" : ""}>Suivant ›</button>
+    </div>`;
+
+  const $ = (id) => document.getElementById(id);
+  const majCompte = () => { const all = $("ab-all").checked; $("ab-count").textContent = all ? `${total} élève(s) (tous les résultats du filtre)` : `${aboSel.size} élève(s) sélectionné(s)`; };
+  majCompte();
+
+  $("ab-filtrer").addEventListener("click", () => { s.search = $("ab-search").value.trim(); s.classe = $("ab-classe").value; s.ecole = $("ab-ecole").value; s.page = 0; aboSel.clear(); renderAbonnements(); });
+  $("ab-search").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("ab-filtrer").click(); });
+  root.querySelectorAll("[data-chip]").forEach(b => b.addEventListener("click", () => { s.etat = b.dataset.chip; s.page = 0; aboSel.clear(); renderAbonnements(); }));
+  $("ab-prev").addEventListener("click", () => { s.page--; renderAbonnements(); });
+  $("ab-next").addEventListener("click", () => { s.page++; renderAbonnements(); });
+  $("ab-all").addEventListener("change", majCompte);
+  $("ab-page").addEventListener("change", (ev) => {
+    root.querySelectorAll("[data-sel]").forEach(c => { c.checked = ev.target.checked; ev.target.checked ? aboSel.add(c.dataset.sel) : aboSel.delete(c.dataset.sel); });
+    majCompte();
+  });
+  root.querySelectorAll("[data-sel]").forEach(c => c.addEventListener("change", () => { c.checked ? aboSel.add(c.dataset.sel) : aboSel.delete(c.dataset.sel); majCompte(); }));
+
+  // Identifiants visés : la sélection, ou tous les résultats du filtre (toutes pages, par paquets de 200).
+  const idsVises = async () => {
+    if (!$("ab-all").checked) return [...aboSel];
+    const out = [];
+    for (let off = 0; off < 20000; off += 200) {
+      const { data, error } = await sb.rpc("admin_list_abonnements", { ...filtres(), p_limit: 200, p_offset: off });
+      if (error || !data || !data.length) break;
+      data.forEach(x => out.push(x.id));
+      if (data.length < 200) break;
+    }
+    return out;
+  };
+  const appliquer = async (libelle, action) => {
+    const ids = await idsVises();
+    if (!ids.length) { NexiGamify.toast("Sélectionnez au moins un élève.", "error"); return; }
+    if (!confirm(`${libelle} pour ${ids.length} élève(s) ?`)) return;
+    for (let i = 0; i < ids.length; i += 1000) {
+      const { error } = await action(ids.slice(i, i + 1000));
+      if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
+    }
+    NexiGamify.toast(`Abonnement mis à jour (${ids.length} élève${ids.length > 1 ? "s" : ""}).`, "success");
+    aboSel.clear(); renderAbonnements();
+  };
+  $("ab-dates").addEventListener("click", () => {
+    const d = $("ab-d").value || null, f = $("ab-f").value || null;
+    if (d && f && d > f) { NexiGamify.toast("La date de fin doit être postérieure à la date de début.", "error"); return; }
+    appliquer(d || f ? `Fixer l'abonnement${d ? " du " + aboDate(d) : ""}${f ? " au " + aboDate(f) : ""}` : "Retirer les dates d'abonnement (sans limite)",
+      (lot) => sb.rpc("admin_set_abonnement", { p_token: tok(), p_eleve_ids: lot, p_debut: d, p_fin: f, p_actif: true }));
+  });
+  root.querySelectorAll("[data-mois]").forEach(b => b.addEventListener("click", () => {
+    const m = Number(b.dataset.mois);
+    appliquer(`Renouveler de ${m} mois`, (lot) => sb.rpc("admin_prolonger_abonnement", { p_token: tok(), p_eleve_ids: lot, p_mois: m }));
+  }));
+
+  root.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => {
+    const x = rows.find(y => y.id === b.dataset.edit);
+    const m = openModal(`
+      <h3>Abonnement — ${esc(x.nom_complet)}</h3>
+      <div class="field"><label>Début</label><input type="date" id="am-d" value="${x.debut || ""}"></div>
+      <div class="field"><label>Fin (incluse)</label><input type="date" id="am-f" value="${x.fin || ""}"></div>
+      <div class="field"><label><input type="checkbox" id="am-a" ${x.abonnement_actif ? "checked" : ""}> Abonnement actif (décocher pour suspendre immédiatement)</label></div>
+      <button class="btn block" id="am-save">Enregistrer</button>`);
+    m.querySelector("#am-save").addEventListener("click", async () => {
+      const d = m.querySelector("#am-d").value || null, f = m.querySelector("#am-f").value || null;
+      if (d && f && d > f) { NexiGamify.toast("La date de fin doit être postérieure à la date de début.", "error"); return; }
+      const { error } = await sb.rpc("admin_set_abonnement", { p_token: tok(), p_eleve_ids: [x.id], p_debut: d, p_fin: f, p_actif: m.querySelector("#am-a").checked });
+      if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
+      m.remove(); NexiGamify.toast("Abonnement enregistré.", "success"); renderAbonnements();
+    });
+  }));
+
+  if (sec) {
+    $("sec-toggle").addEventListener("click", async () => {
+      const activer = !sec.session_unique;
+      if (!confirm(activer ? "Activer « un seul appareil à la fois » ?" : "Désactiver « un seul appareil à la fois » ? Les comptes pourront être ouverts sur plusieurs appareils.")) return;
+      const { error } = await sb.rpc("admin_set_securite", { p_token: tok(), p_session_unique: activer, p_fenetre: null });
+      if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
+      NexiGamify.toast(activer ? "Un seul appareil à la fois : activé." : "Un seul appareil à la fois : désactivé.", "success"); renderAbonnements();
+    });
+    $("sec-fenetre").addEventListener("change", async (ev) => {
+      const { error } = await sb.rpc("admin_set_securite", { p_token: tok(), p_session_unique: null, p_fenetre: Number(ev.target.value) });
+      NexiGamify.toast(error ? "Erreur : " + error.message : "Délai d'inactivité enregistré.", error ? "error" : "success");
+    });
+  }
+
+  $("ab-blocage").addEventListener("click", async () => {
+    const activer = !r.blocage, touches = (r.expire || 0) + (r.a_venir || 0) + (r.inactif || 0);
+    const msg = activer
+      ? `Activer le blocage ?\n\n${touches} élève(s) (expirés, pas encore commencés ou inactifs) n'auront plus accès qu'à leur profil.`
+      : "Désactiver le blocage ? Tous les élèves retrouvent l'accès complet.";
+    if (!confirm(msg)) return;
+    const { error } = await sb.rpc("admin_set_blocage_abonnement", { p_token: tok(), p_actif: activer });
+    if (error) { NexiGamify.toast("Erreur : " + error.message, "error"); return; }
+    NexiGamify.toast(activer ? "Blocage activé." : "Blocage désactivé.", "success"); renderAbonnements();
+  });
+}
+
 // Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
-if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); injectProgrammesTab();
+if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); injectProgrammesTab(); injectAbonnementsTab();
   // Les classes des programmes spéciaux sont chargées AVANT le premier affichage (les formulaires les proposent aussitôt).
   (window.NexiProgrammes ? NexiProgrammes.charger() : Promise.resolve()).catch(() => {}).then(() => render("eleves")); }

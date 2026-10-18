@@ -8,7 +8,144 @@ const sb = getSupabase();
 const root = document.getElementById("view-root");
 let bot;
 
-document.getElementById("btn-logout").addEventListener("click", () => NexiAuth.logout());
+// ---------------------------------------------------------
+// ABONNEMENT — état (début / fin) et verrouillage des rubriques d'apprentissage.
+// Sans effet tant que le patch SQL « abonnements » n'est pas appliqué, et tant que l'admin n'a pas activé le blocage.
+// ---------------------------------------------------------
+// [ABO-DEBUT]
+let vueCourante = "profil";       // dernière rubrique demandée (pour revenir au profil si l'abonnement s'arrête en cours de session)
+const VUES_LIBRES = ["profil"];   // seules pages ouvertes sans abonnement actif (ajoute "notifs" pour laisser lire les messages)
+let abo = null;                   // { etat: actif | a_venir | expire | inactif, acces, blocage, debut, fin, jours_restants } ou null (inconnu = accès normal)
+let aboEnCours = null;
+const MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+function dateLongueFr(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+  return m ? `${Number(m[3])} ${MOIS_FR[Number(m[2]) - 1]} ${m[1]}` : "";
+}
+function aAcces() { return !abo || abo.acces !== false; }
+function isAboError(error) { return (error?.message || "").toLowerCase().includes("abonnement inactif"); }
+function appliquerVerrouNav() {
+  const verrou = !aAcces();
+  document.querySelectorAll(".bottomnav button").forEach(b => {
+    const ferme = verrou && !VUES_LIBRES.includes(b.dataset.view);
+    b.style.opacity = ferme ? ".5" : "";
+    b.setAttribute("aria-disabled", ferme ? "true" : "false");
+  });
+}
+// Une seule requête à la fois (le démarrage et l'affichage du profil la partagent).
+function chargerAbonnement() {
+  if (aboEnCours) return aboEnCours;
+  aboEnCours = (async () => {
+    try {
+      const { data, error } = await sb.rpc("rpc_mon_abonnement", { p_eleve_id: session.id, p_token: session.token });
+      if (error) { if (isAuthError(error)) handleAuthError(); abo = null; }   // patch absent ou réseau : accès normal (le serveur reste juge)
+      else abo = data || null;
+    } catch (e) { abo = null; }
+    appliquerVerrouNav();
+    return abo;
+  })().finally(() => { aboEnCours = null; });
+  return aboEnCours;
+}
+// Boutons de contact : renseigne NEXI_CONFIG.CONTACT_ABONNEMENT = { whatsapp: "243…", email: "…" } dans js/config.js.
+function boutonsContactAbo() {
+  const c = Object.assign({}, window.NEXI_CONTACT, (window.NEXI_CONFIG && window.NEXI_CONFIG.CONTACT_ABONNEMENT) || {});
+  const msg = `Bonjour NEXI ACADEMY, je suis ${session.nom_complet} (identifiant : ${session.identifiant}, classe : ${session.classe || "—"}). Mon abonnement apparaît inactif.`;
+  const out = [];
+  const wa = String(c.whatsapp || "").replace(/\D/g, "");
+  if (wa) out.push(`<a class="btn" href="https://wa.me/${wa}?text=${encodeURIComponent(msg)}" target="_blank" rel="noopener">💬 Écrire sur WhatsApp</a>`);
+  if (/^[^\s@<>"']+@[^\s@<>"']+$/.test(String(c.email || ""))) out.push(`<a class="btn secondary" href="mailto:${escapeHtml(c.email)}?subject=${encodeURIComponent("Abonnement NEXI ONE — " + session.identifiant)}&body=${encodeURIComponent(msg)}">✉️ Envoyer un e-mail</a>`);
+  return out.join(" ");
+}
+// Carte « Mon abonnement » du profil — affichée seulement quand le blocage est activé par l'admin.
+function carteAbonnement() {
+  if (!abo || !abo.blocage) return "";
+  const fin = dateLongueFr(abo.fin), debut = dateLongueFr(abo.debut), j = abo.jours_restants;
+  let couleur = "var(--cyan)", badge = `<span class="badge on">Actif</span>`, titre = "Abonnement actif", detail = "", action = false;
+  if (abo.etat === "actif") {
+    if (j !== null && j !== undefined && j <= 7) {
+      couleur = "var(--gold)"; titre = "Abonnement actif — il se termine bientôt";
+      detail = `Fin ${j === 0 ? "aujourd'hui" : j === 1 ? "demain" : `dans ${j} jours`} (le ${fin}). Renouvelle-le pour ne pas perdre l'accès aux cartes de révision, aux défis et au classement.`;
+      action = true;
+    } else {
+      detail = fin ? `Valable${debut ? ` du ${debut}` : ""} jusqu'au ${fin}.` : "Accès complet aux cartes de révision, aux défis et au classement.";
+    }
+  } else if (abo.etat === "a_venir") {
+    couleur = "var(--gold)"; badge = `<span class="badge pending">À venir</span>`; titre = "Abonnement pas encore commencé";
+    detail = debut ? `Ton accès s'ouvrira le ${debut}.` : "Ton accès s'ouvrira prochainement."; action = true;
+  } else if (abo.etat === "expire") {
+    couleur = "#FF6B6B"; badge = `<span class="badge off">Expiré</span>`; titre = "Abonnement expiré";
+    detail = `${fin ? `Il a pris fin le ${fin}. ` : ""}Réabonne-toi pour retrouver les cartes de révision, les défis et le classement.`; action = true;
+  } else {
+    couleur = "#FF6B6B"; badge = `<span class="badge off">Inactif</span>`; titre = "Abonnement inactif";
+    detail = "Ton accès aux rubriques d'apprentissage est actuellement suspendu."; action = true;
+  }
+  const contact = action ? boutonsContactAbo() : "";
+  return `<div class="card" style="margin:16px 0; border-color:${couleur};">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">${badge}<b>${titre}</b></div>
+      <p style="margin:8px 0 ${contact ? "12px" : "0"}; color:var(--text-dim);">${detail}</p>
+      ${contact ? `<div style="display:flex; gap:8px; flex-wrap:wrap;">${contact}</div>` : ""}
+    </div>`;
+}
+// Écran affiché à la place d'une rubrique verrouillée.
+function renderAbonnementInactif(view) {
+  const quoi = { defis: "les défis", cartes: "les cartes de révision", affinites: "le test d'affinités", classement: "le classement", tournois: "les tournois", notifs: "tes notifications" }[view] || "cette rubrique";
+  const e = abo ? abo.etat : "inactif";
+  const titre = e === "expire" ? "Ton abonnement a expiré" : e === "a_venir" ? "Ton abonnement n'a pas encore commencé" : "Ton abonnement est inactif";
+  const precision = e === "expire" && abo.fin ? `Il a pris fin le <b>${dateLongueFr(abo.fin)}</b>.`
+    : e === "a_venir" && abo.debut ? `Ton accès s'ouvrira le <b>${dateLongueFr(abo.debut)}</b>.`
+    : "Ton accès aux rubriques d'apprentissage est actuellement suspendu.";
+  const contact = boutonsContactAbo();
+  root.innerHTML = `
+    <div class="card" style="max-width:540px; margin:20px auto; text-align:center;">
+      <div style="font-size:2.2rem;" aria-hidden="true">🔒</div>
+      <h2 style="margin:6px 0 10px;">${titre}</h2>
+      <p style="margin:0 0 6px;">Pour accéder à ${quoi}, ton abonnement NEXI ONE doit être actif.</p>
+      <p style="margin:0 0 16px; color:var(--text-dim);">${precision}</p>
+      <div style="text-align:left; border-top:1px solid #1E2A47; padding-top:14px;">
+        <p style="margin:0 0 12px;"><b>Tu veux t'abonner ou te réabonner ?</b><br>Rapproche-toi de ton école ou de NEXI ACADEMY.</p>
+        <p style="margin:0 0 14px;"><b>Tu es déjà abonné(e) mais ton accès reste bloqué ?</b><br>Contacte NEXI ACADEMY en indiquant ton identifiant <b style="color:var(--cyan);">${escapeHtml(session.identifiant)}</b> : ton accès sera rétabli après vérification.</p>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:6px;">
+        ${contact}<button class="btn secondary" id="abo-retour" type="button">← Retour à mon profil</button>
+      </div>
+    </div>`;
+  const back = document.getElementById("abo-retour");
+  if (back) back.addEventListener("click", () => { setActiveNav("profil"); render("profil"); });
+}
+// [ABO-FIN]
+
+// ---------------------------------------------------------
+// SESSION UNIQUE — signal de présence toutes les 45 s (application ouverte) et libération à la déconnexion.
+// Le serveur répond aussi avec l'état d'abonnement à jour : un abonnement qui s'arrête pendant la session
+// ferme les rubriques dans la minute qui suit. Sans effet tant que le patch SQL « sécurité » n'est pas appliqué.
+// ---------------------------------------------------------
+async function pingSession() {
+  try {
+    const { data, error } = await sb.rpc("rpc_session_ping", { p_eleve_id: session.id, p_token: session.token });
+    if (error || !data) return;                                  // réseau ou patch absent : on ne fait rien
+    if (data.ok === false) {
+      if (data.motif === "compte_utilise") { NexiSecurite.compteUtilise({ deconnecter: true }); return; }
+      NexiGamify.toast("Ta session a pris fin : ton compte a été ouvert sur un autre appareil.", "error");
+      setTimeout(() => NexiAuth.logout(), 2500);
+      return;
+    }
+    if (data.abonnement) {
+      abo = data.abonnement; appliquerVerrouNav();
+      if (!aAcces() && !VUES_LIBRES.includes(vueCourante)) { setActiveNav("profil"); render("profil"); }
+    }
+  } catch (e) { /* ignoré */ }
+}
+function demarrerPing() {
+  pingSession();
+  setInterval(() => { if (document.visibilityState === "visible") pingSession(); }, 45000);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pingSession(); });
+}
+// À la déconnexion : le compte est libéré tout de suite (un autre appareil peut s'y connecter aussitôt).
+async function libererSession() {
+  try { await Promise.race([sb.rpc("rpc_session_liberer", { p_eleve_id: session.id, p_token: session.token }), new Promise(r => setTimeout(r, 2500))]); } catch (e) { /* ignoré */ }
+}
+
+document.getElementById("btn-logout").addEventListener("click", async () => { await detacherAppareilPush(); await libererSession(); NexiAuth.logout(); });
 document.querySelectorAll(".bottomnav button").forEach(btn => {
   btn.addEventListener("click", () => { setActiveNav(btn.dataset.view); render(btn.dataset.view); });
 });
@@ -21,16 +158,19 @@ function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":
 // proprement vers la reconnexion.
 function isAuthError(error) {
   const msg = (error?.message || "").toLowerCase();
-  return msg.includes("non autorisé") || msg.includes("jwt") || msg.includes("permission denied");
+  return msg.includes("non autorisé") || msg.includes("jwt") || msg.includes("permission denied") || msg.includes("compte déjà utilisé");
 }
 function handleAuthError() {
+  if (window.NexiSecurite && NexiSecurite.recent()) return;   // « Compte déjà utilisé » : le message s'en charge (et déconnecte à la fermeture)
   NexiGamify.toast("Session expirée — reconnexion nécessaire.", "error");
   setTimeout(() => NexiAuth.logout(), 1500);
 }
 
-async function init() { bot = mountNexiBot(document.body); render("profil"); await initNotifs(); initTournois(); }
+async function init() { bot = mountNexiBot(document.body); const pAbo = chargerAbonnement(); render("profil"); await pAbo; demarrerPing(); await initNotifs(); if (aAcces()) initTournois(); initPush(); }
 
 async function render(view) {
+  vueCourante = view;
+  if (!aAcces() && !VUES_LIBRES.includes(view)) return renderAbonnementInactif(view);   // abonnement non actif : profil uniquement
   root.innerHTML = `<div class="empty-state"><h4>Chargement…</h4></div>`;
   if (view === "profil") return renderProfil();
   if (view === "defis") return renderDefisListe();
@@ -45,7 +185,7 @@ async function render(view) {
 // PROFIL — un seul appel RPC agrégé côté serveur
 // ---------------------------------------------------------
 async function renderProfil() {
-  const { data, error } = await sb.rpc("rpc_mon_profil", { p_eleve_id: session.id, p_token: session.token });
+  const [{ data, error }] = await Promise.all([sb.rpc("rpc_mon_profil", { p_eleve_id: session.id, p_token: session.token }), chargerAbonnement()]);
   const profil = (data && data[0]) || { score_par_categorie: {}, score_total: 0, defis_faits: 0, profil_dominant: null };
   if (error) {
     console.error("rpc_mon_profil:", error);
@@ -65,6 +205,7 @@ async function renderProfil() {
       </div>
     </div>
     <input type="file" id="avatar-input" accept="image/*" style="display:none;">
+    ${carteAbonnement()}
     <div class="stat-grid">
       <div class="stat"><div class="val">${Math.round(profil.score_total)}</div><div class="lab">Points cumulés</div></div>
       <div class="stat"><div class="val">${profil.defis_faits}</div><div class="lab">Défis complétés</div></div>
@@ -156,7 +297,10 @@ async function renderDefisListe() {
 }
 
 async function startQuiz(defiId) {
-  const { data: questions, error } = await sb.rpc("rpc_questions_defi", { p_defi_id: defiId });
+  let { data: questions, error } = await sb.rpc("rpc_questions_defi_v2", { p_eleve_id: session.id, p_token: session.token, p_defi_id: defiId });
+  if (error && isMissingFn(error)) ({ data: questions, error } = await sb.rpc("rpc_questions_defi", { p_defi_id: defiId }));   // avant le patch sécurité
+  if (error && isAuthError(error)) return handleAuthError();
+  if (error && isAboError(error)) { await chargerAbonnement(); return renderAbonnementInactif("defis"); }
   if (error || !questions || !questions.length) { NexiGamify.toast("Ce défi n'a pas encore de questions.", "error"); return; }
   let idx = 0, reponses = [], timerInterval;
 
@@ -338,40 +482,6 @@ async function renderAffinites() {
 // ---------------------------------------------------------
 // CARTES DE RÉVISION — ancien affichage (conservé comme filet de sécurité)
 // ---------------------------------------------------------
-async function renderCartesLegacy() {
-  const { data: cartes, error } = await sb.from("cartes_revision").select("*, categories(nom)").eq("classe", session.classe).eq("masque", false);
-  if (error) console.error("cartes_revision:", error);
-  if (!cartes || !cartes.length) {
-    root.innerHTML = `<div class="empty-state"><h4>Pas encore de cartes</h4><p>Aucune carte visible pour la classe <b>${escapeHtml(session.classe || "—")}</b> pour l'instant. Si l'admin en a pourtant importé, vérifie que la classe saisie lors de l'import correspond exactement à ce code.</p></div>`;
-    return;
-  }
-  let idx = 0;
-  function renderCard() {
-    const c = cartes[idx];
-    root.innerHTML = `
-      <h2>Cartes de révision</h2>
-      <p style="text-align:center; color:var(--text-dim);">${idx + 1} / ${cartes.length} — ${escapeHtml(c.categories?.nom || "")}</p>
-      <div class="flash-wrap">
-        <div class="flash-card" id="flash">
-          <div class="flash-face front">${escapeHtml(c.recto)}</div>
-          <div class="flash-face back">
-            <div class="reponse">${escapeHtml(c.verso_reponse)}</div>
-            ${c.verso_explication ? `<div class="explication">${escapeHtml(c.verso_explication)}</div>` : ""}
-          </div>
-        </div>
-      </div>
-      <div class="flash-nav">
-        <button class="btn secondary" id="c-prev" ${idx === 0 ? "disabled" : ""}>◀ Précédent</button>
-        <button class="btn secondary" id="c-next" ${idx === cartes.length - 1 ? "disabled" : ""}>Suivant ▶</button>
-      </div>
-    `;
-    document.getElementById("flash").addEventListener("click", (e) => e.currentTarget.classList.toggle("flipped"));
-    document.getElementById("c-prev").addEventListener("click", () => { idx--; renderCard(); });
-    document.getElementById("c-next").addEventListener("click", () => { idx++; renderCard(); });
-  }
-  renderCard();
-}
-
 // ---------------------------------------------------------
 // CARTES DE RÉVISION PAR COURS
 // L'élève voit d'abord les cours de sa classe, puis les cartes du cours choisi.
@@ -407,8 +517,10 @@ async function renderCartes() {
   const { data: cours, error } = await sb.rpc("rpc_cours_classe", { p_eleve_id: session.id, p_token: session.token });
   if (error) {
     if (isAuthError(error)) return handleAuthError();
-    if (!isMissingFn(error)) console.error("rpc_cours_classe:", error);
-    return renderCartesLegacy();
+    if (isAboError(error)) { await chargerAbonnement(); return renderAbonnementInactif("cartes"); }   // jamais de repli sur l'ancienne lecture directe
+    console.error("rpc_cours_classe:", error);
+    root.innerHTML = `<div class="empty-state"><h4>Cartes indisponibles</h4><p>Impossible de charger les cartes pour le moment. Réessaie dans un instant.</p></div>`;
+    return;
   }
   if (!cours || !cours.length) {
     root.innerHTML = `<div class="empty-state"><h4>Pas encore de cartes</h4><p>Aucune carte visible pour la classe <b>${escapeHtml(session.classe || "—")}</b> pour l'instant. Reviens bientôt !</p></div>`;
@@ -440,6 +552,7 @@ async function ouvrirCours(c) {
     const { data, error } = await sb.rpc("rpc_cartes_cours", { p_eleve_id: session.id, p_token: session.token, p_cours_id: c.id, p_limit: 500, p_offset: page * 500 });
     if (error) {
       if (isAuthError(error)) return handleAuthError();
+      if (isAboError(error)) { await chargerAbonnement(); return renderAbonnementInactif("cartes"); }
       console.error("rpc_cartes_cours:", error);
       root.innerHTML = `<div class="empty-state"><h4>Erreur de chargement</h4><p>${escapeHtml(error.message || "")}</p><button class="btn secondary" id="c-back">← Les cours</button></div>`;
       document.getElementById("c-back").addEventListener("click", renderCartes);
@@ -584,7 +697,7 @@ async function renderNotifs() {
     return;
   }
   const liste = data || [], ICONES = { defi: "🎯", cartes: "🗂️", message: "📢" };
-  root.innerHTML = `<h2>Notifications</h2>` + (liste.length
+  root.innerHTML = `<h2>Notifications</h2><div id="push-card"></div>` + (liste.length
     ? `<div class="notif-list">${liste.map((n, i) => `
         <button type="button" class="notif-item${n.nouvelle ? " new" : ""}" data-i="${i}">
           <span class="ico">${ICONES[n.type] || "🔔"}</span>
@@ -596,6 +709,7 @@ async function renderNotifs() {
     if (n.type === "defi") { setActiveNav("defis"); render("defis"); }
     else if (n.type === "cartes") { setActiveNav("cartes"); render("cartes"); }
   }));
+  remplirCartePush();
   if (liste.some(n => n.nouvelle)) {                  // l'affichage garde la mise en évidence ; le compteur retombe à 0
     const r = await sb.rpc("rpc_notifs_marquer_lues", { p_eleve_id: session.id, p_token: session.token });
     if (!r.error) setNotifsBadge(0, false);
@@ -710,6 +824,121 @@ async function renderTournoiDetail(id) {
   document.getElementById("tn-back").addEventListener("click", renderTournois);
   root.querySelectorAll("[data-jouer]").forEach(b => b.addEventListener("click", () => startQuiz(b.dataset.jouer)));
   if (fini && mon && mon.rang === 1) { try { const k = "nexi_tn_win_" + t.id; if (!localStorage.getItem(k)) { localStorage.setItem(k, "1"); bot && bot.reactBravo(); } } catch (e) { /* ignoré */ } }
+}
+
+// ---------------------------------------------------------
+// ALERTES PUSH — recevoir les notifications sur le téléphone, même appli fermée / écran verrouillé.
+// Gratuit (Web Push). Silencieux tant que le patch SQL « push » n'est pas appliqué.
+// Android : fonctionne dans Chrome. iPhone : l'appli doit d'abord être ajoutée à l'écran d'accueil.
+// ---------------------------------------------------------
+const VAPID_PUBLIC_KEY = "BK8Gi7AE0oL3Lv_1qJbZ6J5OC1BWB7TDCUQtHI6owFH_G_klfKhpzJXst-RhTBeRJFXve7Z4JfALYrbdLaiKxiM";
+const pushSupporte = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const estIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent || "");
+const estInstallee = () => (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+const cleVersBytes = (b64u) => { const b = atob((b64u + "=".repeat((4 - (b64u.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from(b, c => c.charCodeAt(0)); };
+const memeCle = (a, b) => { if (!a || !b || a.byteLength !== b.length) return false; const x = new Uint8Array(a); return x.every((v, i) => v === b[i]); };
+let pushDisponible = null;   // null = pas encore testé ; true/false ensuite
+
+async function pushServeurPret() {
+  if (pushDisponible !== null) return pushDisponible;
+  // Sonde inoffensive : la fonction existe-t-elle ? (ne supprime rien : l'adresse testée n'existe pas)
+  const { error } = await sb.rpc("rpc_push_desabonner", { p_eleve_id: session.id, p_token: session.token, p_endpoint: "https://sonde.invalid/" });
+  pushDisponible = !error;
+  return pushDisponible;
+}
+
+async function etatPush() {
+  if (!pushSupporte()) return estIOS() && !estInstallee() ? "ios_installer" : "non_supporte";
+  if (estIOS() && !estInstallee()) return "ios_installer";
+  if (Notification.permission === "denied") return "refuse";
+  if (Notification.permission !== "granted") return "inactif";
+  try { const reg = await navigator.serviceWorker.ready; return (await reg.pushManager.getSubscription()) ? "actif" : "inactif"; } catch (e) { return "inactif"; }
+}
+
+async function enregistrerAbonnement(sub) {
+  const j = sub.toJSON();
+  const { error } = await sb.rpc("rpc_push_abonner", { p_eleve_id: session.id, p_token: session.token, p_endpoint: sub.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth, p_ua: navigator.userAgent });
+  if (error) { if (isAuthError(error)) { handleAuthError(); throw new Error("Session expirée."); } throw new Error(isMissingFn(error) ? "Alertes pas encore disponibles." : error.message); }
+}
+
+async function activerPush() {
+  if (!pushSupporte()) throw new Error("Ce navigateur ne permet pas les alertes sur téléphone.");
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") throw new Error(perm === "denied" ? "Alertes bloquées : autorise-les dans les réglages du navigateur." : "Alertes non activées.");
+  const reg = await navigator.serviceWorker.ready, cle = cleVersBytes(VAPID_PUBLIC_KEY);
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !memeCle(sub.options && sub.options.applicationServerKey, cle)) { await sub.unsubscribe(); sub = null; }   // ancienne clé du serveur : on repart proprement
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: cle });
+  await enregistrerAbonnement(sub);
+  try { localStorage.setItem("nexi_push", "1"); } catch (e) { /* ignoré */ }
+}
+
+async function desactiverPush() {
+  const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+  if (sub) {
+    await sb.rpc("rpc_push_desabonner", { p_eleve_id: session.id, p_token: session.token, p_endpoint: sub.endpoint });
+    await sub.unsubscribe();
+  }
+  try { localStorage.removeItem("nexi_push"); } catch (e) { /* ignoré */ }
+}
+
+// À la déconnexion : cet appareil ne doit plus recevoir les alertes de cet élève (le suivant les reprendra à sa connexion)
+async function detacherAppareilPush() {
+  try {
+    if (!pushSupporte() || Notification.permission !== "granted") return;
+    const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription();
+    if (sub) await Promise.race([sb.rpc("rpc_push_desabonner", { p_eleve_id: session.id, p_token: session.token, p_endpoint: sub.endpoint }), new Promise(r => setTimeout(r, 1500))]);
+  } catch (e) { /* ignoré : la déconnexion ne doit jamais être bloquée */ }
+}
+
+function cssPush() {
+  if (document.getElementById("nexi-push-css")) return;
+  const st = document.createElement("style"); st.id = "nexi-push-css";
+  st.textContent = ".push-banner{position:fixed;left:12px;right:12px;bottom:88px;z-index:70;padding:12px 14px;border-radius:16px;border:1px solid #29F1E0;background:rgba(11,22,48,.96);color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.4)}" +
+    ".push-banner b{display:block;margin-bottom:4px}.push-banner .row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}";
+  document.head.appendChild(st);
+}
+
+// Bandeau d'invitation (une fois par appareil, puis rappel après 7 jours si « Plus tard »)
+async function initPush() {
+  try {
+    if (!(await pushServeurPret())) return;
+    const etat = await etatPush();
+    if (etat === "actif") { activerPush().catch(() => {}); return; }   // permission déjà accordée (aucune fenêtre) : rattache l'appareil à l'élève connecté et se réabonne si la clé du serveur a changé
+    if (etat === "refuse" || etat === "non_supporte") return;
+    let plusTard = 0; try { plusTard = Number(localStorage.getItem("nexi_push_plus_tard") || 0); } catch (e) { /* ignoré */ }
+    if (Date.now() - plusTard < 7 * 86400000) return;
+    cssPush();
+    const b = document.createElement("div"); b.className = "push-banner"; b.id = "push-banner";
+    b.innerHTML = etat === "ios_installer"
+      ? `<b>📲 Reçois les alertes sur ton iPhone</b>Ajoute d'abord NEXI ONE à l'écran d'accueil (Partager → « Sur l'écran d'accueil »), puis ouvre-la depuis l'icône.<div class="row"><button class="btn secondary" id="push-later">OK</button></div>`
+      : `<b>🔔 Reçois les alertes sur ton téléphone</b>Nouveaux défis, tournois, messages de ton école : même quand l'appli est fermée.<div class="row"><button class="btn" id="push-go">Activer</button><button class="btn secondary" id="push-later">Plus tard</button></div>`;
+    document.body.appendChild(b);
+    const fermer = () => { try { localStorage.setItem("nexi_push_plus_tard", String(Date.now())); } catch (e) { /* ignoré */ } b.remove(); };
+    document.getElementById("push-later").addEventListener("click", fermer);
+    const go = document.getElementById("push-go");
+    if (go) go.addEventListener("click", async () => {
+      try { await activerPush(); b.remove(); NexiGamify.toast("🔔 Alertes activées sur ce téléphone.", "success"); }
+      catch (e) { NexiGamify.toast(e.message, "error"); if (Notification.permission === "denied") b.remove(); }
+    });
+  } catch (e) { /* jamais bloquant */ }
+}
+
+// Carte « Alertes sur ce téléphone » en haut de l'écran Notifications
+async function remplirCartePush() { try { await remplirCartePushInterne(); } catch (e) { /* l'écran des notifications ne doit jamais dépendre du push */ } }
+async function remplirCartePushInterne() {
+  const zone = document.getElementById("push-card"); if (!zone) return;
+  if (!(await pushServeurPret())) { zone.innerHTML = ""; return; }
+  const etat = await etatPush(); let html = "";
+  if (etat === "actif") html = `📲 Alertes activées sur ce téléphone ✅ <button class="btn secondary" id="push-off" style="margin-left:8px;">Désactiver</button>`;
+  else if (etat === "inactif") html = `📲 Reçois les alertes sur ton téléphone, même appli fermée. <button class="btn" id="push-on" style="margin-left:8px;">Activer</button>`;
+  else if (etat === "refuse") html = "📲 Alertes bloquées. Pour les recevoir, autorise les notifications de ce site dans les réglages de ton navigateur.";
+  else if (etat === "ios_installer") html = "📲 Sur iPhone : ajoute d'abord NEXI ONE à l'écran d'accueil (Partager → « Sur l'écran d'accueil »), puis ouvre-la depuis l'icône pour activer les alertes.";
+  else html = "📲 Ce navigateur ne permet pas les alertes sur téléphone.";
+  zone.innerHTML = `<div class="tn-card">${html}</div>`;
+  const on = document.getElementById("push-on"), off = document.getElementById("push-off");
+  if (on) on.addEventListener("click", async () => { on.disabled = true; try { await activerPush(); NexiGamify.toast("🔔 Alertes activées.", "success"); } catch (e) { NexiGamify.toast(e.message, "error"); } remplirCartePush(); });
+  if (off) off.addEventListener("click", async () => { off.disabled = true; try { await desactiverPush(); NexiGamify.toast("Alertes désactivées sur ce téléphone.", "success"); } catch (e) { NexiGamify.toast(e.message, "error"); } remplirCartePush(); });
 }
 
 // ---------------------------------------------------------
