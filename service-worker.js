@@ -41,3 +41,31 @@ self.addEventListener("fetch", (e) => {
       .catch(() => caches.match(e.request).then((cached) => cached || caches.match("./index.html")))
   );
 });
+
+// =========================================================
+// NOTIFICATIONS PUSH : affichage même quand l'application est fermée, et ouverture au clic
+// =========================================================
+self.addEventListener("push", (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { d = { titre: "NEXI ONE", corps: event.data ? event.data.text() : "" }; }
+  event.waitUntil(self.registration.showNotification(d.titre || "NEXI ONE", {
+    body: d.corps || "",
+    icon: "./icons/icon-192.png",
+    badge: "./icons/icon-192.png",
+    tag: d.tag || undefined,            // une même notification ne s'affiche pas deux fois
+    renotify: false,
+    vibrate: [120, 60, 120],
+    data: { url: d.url || "./eleve.html" }
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL((event.notification.data && event.notification.data.url) || "./eleve.html", self.registration.scope).href;
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((fenetres) => {
+      for (const f of fenetres) { if ("focus" in f) return f.focus(); }   // l'appli est déjà ouverte : on la met au premier plan
+      return clients.openWindow(url);
+    })
+  );
+});
