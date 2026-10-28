@@ -58,6 +58,7 @@ async function render(view) {
   if (view === "tournois") return renderTournois();
   if (view === "programmes") return renderProgrammes();
   if (view === "abonnements") return renderAbonnements();
+  if (view === "classes") return renderClasses();
   if (view === "defis") return renderDefis();
   if (view === "affinites") return renderAffinites();
   if (view === "cartes") return renderCartes();
@@ -2072,7 +2073,95 @@ async function renderAbonnements() {
   });
 }
 
+// =========================================================
+// CLASSES NATIONALES (admin) — options / sections des Humanités : ajouter, renommer, supprimer.
+// Une option ajoutée ici apparaît aussitôt (par ordre alphabétique) dans l'inscription, les fiches élèves, les défis, les cartes…
+// =========================================================
+const clsEtat = { filtre: "" };
+const clsAbsent = (error) => !!error && (error.code === "PGRST202" || /could not find the function|schema cache/i.test(error.message || ""));
+const clsTri = (a, b) => String(a.libelle).localeCompare(String(b.libelle), "fr", { sensitivity: "base", numeric: true });
+
+function injectClassesTab() {
+  const tabs = document.querySelector(".admin-tabs");
+  if (!tabs || tabs.querySelector('[data-view="classes"]')) return;
+  const b = document.createElement("button");
+  b.dataset.view = "classes"; b.textContent = "🎓 Classes";
+  b.addEventListener("click", () => {
+    tabs.querySelectorAll("button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active"); render("classes");
+  });
+  tabs.appendChild(b);
+}
+
+async function renderClasses() {
+  const { data, error } = await sb.rpc("admin_list_classes_nationales", { p_token: tok() });
+  if (error) {
+    const absent = clsAbsent(error);
+    root.innerHTML = `<div class="empty-state"><h4>${absent ? "Classes non activées" : "Erreur d'accès"}</h4><p>${esc(absent ? "Exécutez d'abord le patch SQL « options des Humanités » dans Supabase." : error.message || "")}</p></div>`;
+    return;
+  }
+  const rows = data || [];
+  const ajoutees = rows.filter(r => r.modifiable).sort(clsTri), origine = rows.filter(r => !r.modifiable);
+  const q = clsEtat.filtre.toLowerCase();
+  const visibles = q ? ajoutees.filter(r => (r.libelle + " " + r.code).toLowerCase().includes(q)) : ajoutees;
+  const ligne = (r, edit) => `<tr><td>${esc(r.libelle)}</td><td><code>${esc(r.code)}</code></td><td>${r.nb_eleves}</td><td>${r.nb_defis}</td><td>${r.nb_cartes}</td>
+    <td>${edit ? `<button class="btn secondary" data-ren="${esc(r.code)}" style="padding:6px 12px;">Renommer</button>
+      <button class="btn secondary" data-sup="${esc(r.code)}" style="padding:6px 12px;" ${Number(r.nb_eleves) + Number(r.nb_defis) + Number(r.nb_cartes) > 0 ? 'disabled title="Classe utilisée : suppression impossible"' : ""}>Supprimer</button>` : ""}</td></tr>`;
+  const entete = `<thead><tr><th>Classe</th><th>Code</th><th>Élèves</th><th>Défis</th><th>Cartes</th><th></th></tr></thead>`;
+
+  root.innerHTML = `
+    <h2 style="margin:0 0 6px;">Classes nationales</h2>
+    <p style="margin:0 0 14px; font-size:.92rem;">Ajoutez ici une option (ex. Électronique) : ses niveaux apparaissent aussitôt, par ordre alphabétique, dans l'inscription et dans tous les formulaires. Une classe utilisée par des élèves, des défis ou des cartes ne peut pas être supprimée.</p>
+    <div class="card" style="margin-bottom:16px;">
+      <b>Ajouter une option</b>
+      <div class="field" style="margin-top:10px;"><label>Nom de l'option (ex. Électronique, Commerciale et gestion, Littéraire…)</label><input id="cl-nom" maxlength="60" placeholder="Nom de l'option"></div>
+      <div style="display:flex; gap:14px; flex-wrap:wrap; margin-bottom:12px;">
+        ${[1, 2, 3, 4].map(n => `<label><input type="checkbox" data-niv="${n}" checked> ${n}${n === 1 ? "ère" : "ème"} année</label>`).join("")}
+      </div>
+      <button class="btn" id="cl-add">Ajouter l'option</button>
+    </div>
+    <div class="filters-row"><input id="cl-filtre" placeholder="Rechercher une classe ajoutée" value="${esc(clsEtat.filtre)}"></div>
+    <h3 style="margin:14px 0 8px;">Options ajoutées (${ajoutees.length} classes)</h3>
+    <div class="table-wrap"><table>${entete}<tbody>${visibles.map(r => ligne(r, true)).join("") || `<tr><td colspan="6">Aucune classe.</td></tr>`}</tbody></table></div>
+    <details style="margin-top:18px;"><summary style="cursor:pointer;">Classes d'origine (${origine.length}), non modifiables</summary>
+      <div class="table-wrap" style="margin-top:8px;"><table>${entete}<tbody>${origine.map(r => ligne(r, false)).join("") || `<tr><td colspan="6">—</td></tr>`}</tbody></table></div>
+    </details>`;
+
+  const $ = (id) => document.getElementById(id);
+  const actualiser = async () => { if (window.NexiProgrammes) await NexiProgrammes.charger(); renderClasses(); };   // la nouvelle liste est reprise partout
+  $("cl-filtre").addEventListener("input", (ev) => { clsEtat.filtre = ev.target.value.trim(); renderClasses(); const f = $("cl-filtre"); f.focus(); f.setSelectionRange(f.value.length, f.value.length); });
+  $("cl-add").addEventListener("click", async () => {
+    const nom = $("cl-nom").value.trim();
+    const niveaux = [...root.querySelectorAll("[data-niv]")].filter(c => c.checked).map(c => Number(c.dataset.niv));
+    if (nom.length < 3) { NexiGamify.toast("Saisissez le nom de l'option (3 caractères minimum).", "error"); return; }
+    if (!niveaux.length) { NexiGamify.toast("Choisissez au moins un niveau.", "error"); return; }
+    const { data: n, error: err } = await sb.rpc("admin_ajouter_section", { p_token: tok(), p_section: nom, p_niveaux: niveaux });
+    if (err) { NexiGamify.toast("Erreur : " + err.message, "error"); return; }
+    NexiGamify.toast(n > 0 ? `${n} classe(s) ajoutée(s).` : "Cette option existe déjà pour ces niveaux.", n > 0 ? "success" : "error");
+    clsEtat.filtre = ""; actualiser();
+  });
+  root.querySelectorAll("[data-ren]").forEach(b => b.addEventListener("click", () => {
+    const r = rows.find(x => x.code === b.dataset.ren);
+    const m = openModal(`<h3>Renommer la classe</h3>
+      <p style="font-size:.85rem;">Code : <code>${esc(r.code)}</code> (ne change jamais : les élèves, défis et cartes restent rattachés).</p>
+      <div class="field"><label>Libellé affiché</label><input id="cr-lib" maxlength="90" value="${esc(r.libelle)}"></div>
+      <button class="btn block" id="cr-save">Enregistrer</button>`);
+    m.querySelector("#cr-save").addEventListener("click", async () => {
+      const { error: err } = await sb.rpc("admin_renommer_classe", { p_token: tok(), p_code: r.code, p_libelle: m.querySelector("#cr-lib").value });
+      if (err) { NexiGamify.toast("Erreur : " + err.message, "error"); return; }
+      m.remove(); NexiGamify.toast("Classe renommée.", "success"); actualiser();
+    });
+  }));
+  root.querySelectorAll("[data-sup]").forEach(b => b.addEventListener("click", async () => {
+    const r = rows.find(x => x.code === b.dataset.sup);
+    if (!confirm(`Supprimer la classe « ${r.libelle} » ?`)) return;
+    const { error: err } = await sb.rpc("admin_supprimer_classe", { p_token: tok(), p_code: r.code });
+    if (err) { NexiGamify.toast("Erreur : " + err.message, "error"); return; }
+    NexiGamify.toast("Classe supprimée.", "success"); actualiser();
+  }));
+}
+
 // Premier affichage : volontairement en fin de fichier, une fois toutes les constantes initialisées.
-if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); injectProgrammesTab(); injectAbonnementsTab();
+if (session && session.role === "admin") { injectNotifTab(); injectStockageTab(); injectTournoiTab(); injectProgrammesTab(); injectAbonnementsTab(); injectClassesTab();
   // Les classes des programmes spéciaux sont chargées AVANT le premier affichage (les formulaires les proposent aussitôt).
   (window.NexiProgrammes ? NexiProgrammes.charger() : Promise.resolve()).catch(() => {}).then(() => render("eleves")); }

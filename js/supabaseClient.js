@@ -121,8 +121,14 @@ window.NexiProgrammes = (function () {
       if (c.error || p.error || !c.data || !p.data) return false;                       // patch SQL absent : rien ne change
       programmes = p.data;
       const CL = window.NEXI_CONFIG.CLASSES;
-      for (let i = CL.length - 1; i >= 0; i--) if (CL[i].programme_id) CL.splice(i, 1);   // recharge propre
+      for (let i = CL.length - 1; i >= 0; i--) if (CL[i].programme_id || CL[i].dynamique) CL.splice(i, 1);   // recharge propre
       const deja = new Set(CL.map(x => x.code));
+      // Classes nationales ajoutées dans la base (options des Humanités, etc.) : après celles d'origine, par ordre alphabétique.
+      // Ajouter une option depuis l'onglet « Classes » du panneau admin suffit : elle apparaît partout, sans toucher au code.
+      c.data.filter(r => !r.programme_id && !deja.has(r.code))
+        .map(r => ({ code: r.code, libelle: r.libelle, dynamique: true }))
+        .sort((a, b) => a.libelle.localeCompare(b.libelle, "fr", { sensitivity: "base", numeric: true }))
+        .forEach(x => CL.push(x));
       c.data.filter(r => r.programme_id && !deja.has(r.code)).forEach(r =>
         CL.push({ code: r.code, libelle: `${r.libelle} · ${nom(r.programme_id) || "programme"}`, programme_id: r.programme_id }));
       if (opts.ecoleId && opts.restreindre) {
@@ -136,5 +142,11 @@ window.NexiProgrammes = (function () {
     } catch (e) { return false; }
   }
   function nom(id) { const p = programmes.find(x => x.id === id); return p ? p.nom : null; }
-  return { charger, nom, liste: () => programmes };
+  // Libellé lisible d'une classe à partir de son code (le code lui-même si inconnue).
+  function libelle(code) {
+    const CL = (window.NEXI_CONFIG && window.NEXI_CONFIG.CLASSES) || [];
+    const c = CL.find(x => x.code === code);
+    return c ? c.libelle : (code || "");
+  }
+  return { charger, nom, libelle, liste: () => programmes };
 })();

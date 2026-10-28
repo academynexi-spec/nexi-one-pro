@@ -13,6 +13,8 @@ let bot;
 // Sans effet tant que le patch SQL « abonnements » n'est pas appliqué, et tant que l'admin n'a pas activé le blocage.
 // ---------------------------------------------------------
 // [ABO-DEBUT]
+let classesPrete = Promise.resolve();   // chargement des classes (libellés lisibles, ex. « Mécanique générale — 4ème humanités »)
+function libelleClasse(code) { return (window.NexiProgrammes && NexiProgrammes.libelle) ? NexiProgrammes.libelle(code) : (code || ""); }
 let vueCourante = "profil";       // dernière rubrique demandée (pour revenir au profil si l'abonnement s'arrête en cours de session)
 const VUES_LIBRES = ["profil"];   // seules pages ouvertes sans abonnement actif (ajoute "notifs" pour laisser lire les messages)
 let abo = null;                   // { etat: actif | a_venir | expire | inactif, acces, blocage, debut, fin, jours_restants } ou null (inconnu = accès normal)
@@ -49,7 +51,7 @@ function chargerAbonnement() {
 // Boutons de contact : renseigne NEXI_CONFIG.CONTACT_ABONNEMENT = { whatsapp: "243…", email: "…" } dans js/config.js.
 function boutonsContactAbo() {
   const c = Object.assign({}, window.NEXI_CONTACT, (window.NEXI_CONFIG && window.NEXI_CONFIG.CONTACT_ABONNEMENT) || {});
-  const msg = `Bonjour NEXI ACADEMY, je suis ${session.nom_complet} (identifiant : ${session.identifiant}, classe : ${session.classe || "—"}). Mon abonnement apparaît inactif.`;
+  const msg = `Bonjour NEXI ACADEMY, je suis ${session.nom_complet} (identifiant : ${session.identifiant}, classe : ${libelleClasse(session.classe) || "—"}). Mon abonnement apparaît inactif.`;
   const out = [];
   const wa = String(c.whatsapp || "").replace(/\D/g, "");
   if (wa) out.push(`<a class="btn" href="https://wa.me/${wa}?text=${encodeURIComponent(msg)}" target="_blank" rel="noopener">💬 Écrire sur WhatsApp</a>`);
@@ -166,7 +168,7 @@ function handleAuthError() {
   setTimeout(() => NexiAuth.logout(), 1500);
 }
 
-async function init() { bot = mountNexiBot(document.body); const pAbo = chargerAbonnement(); render("profil"); await pAbo; demarrerPing(); await initNotifs(); if (aAcces()) initTournois(); initPush(); }
+async function init() { bot = mountNexiBot(document.body); const pAbo = chargerAbonnement(); classesPrete = window.NexiProgrammes ? NexiProgrammes.charger().catch(() => {}) : Promise.resolve(); render("profil"); await pAbo; demarrerPing(); await initNotifs(); if (aAcces()) initTournois(); initPush(); }
 
 async function render(view) {
   vueCourante = view;
@@ -185,7 +187,7 @@ async function render(view) {
 // PROFIL — un seul appel RPC agrégé côté serveur
 // ---------------------------------------------------------
 async function renderProfil() {
-  const [{ data, error }] = await Promise.all([sb.rpc("rpc_mon_profil", { p_eleve_id: session.id, p_token: session.token }), chargerAbonnement()]);
+  const [{ data, error }] = await Promise.all([sb.rpc("rpc_mon_profil", { p_eleve_id: session.id, p_token: session.token }), chargerAbonnement(), classesPrete]);
   const profil = (data && data[0]) || { score_par_categorie: {}, score_total: 0, defis_faits: 0, profil_dominant: null };
   if (error) {
     console.error("rpc_mon_profil:", error);
@@ -201,7 +203,7 @@ async function renderProfil() {
       </div>
       <div>
         <h2 style="margin-bottom:2px;">${escapeHtml(session.nom_complet)}</h2>
-        <p style="margin:0;">Identifiant : <b style="color:var(--cyan);">${escapeHtml(session.identifiant)}</b> · Classe ${escapeHtml(session.classe || "—")}</p>
+        <p style="margin:0;">Identifiant : <b style="color:var(--cyan);">${escapeHtml(session.identifiant)}</b> · Classe ${escapeHtml(libelleClasse(session.classe) || "—")}</p>
       </div>
     </div>
     <input type="file" id="avatar-input" accept="image/*" style="display:none;">
@@ -284,7 +286,7 @@ async function renderDefisListe() {
     return;
   }
   if (!defis || !defis.length) {
-    root.innerHTML = `<div class="empty-state"><h4>Aucun défi disponible</h4><p>Reviens bientôt, ton superviseur ou l'admin publiera le prochain défi pour la classe <b>${escapeHtml(session.classe || "—")}</b>.</p></div>`;
+    root.innerHTML = `<div class="empty-state"><h4>Aucun défi disponible</h4><p>Reviens bientôt, ton superviseur ou l'admin publiera le prochain défi pour la classe <b>${escapeHtml(libelleClasse(session.classe) || "—")}</b>.</p></div>`;
     return;
   }
   root.innerHTML = `<h2>Défis</h2>` + defis.map(d => `
@@ -523,7 +525,7 @@ async function renderCartes() {
     return;
   }
   if (!cours || !cours.length) {
-    root.innerHTML = `<div class="empty-state"><h4>Pas encore de cartes</h4><p>Aucune carte visible pour la classe <b>${escapeHtml(session.classe || "—")}</b> pour l'instant. Reviens bientôt !</p></div>`;
+    root.innerHTML = `<div class="empty-state"><h4>Pas encore de cartes</h4><p>Aucune carte visible pour la classe <b>${escapeHtml(libelleClasse(session.classe) || "—")}</b> pour l'instant. Reviens bientôt !</p></div>`;
     return;
   }
   root.innerHTML = `
